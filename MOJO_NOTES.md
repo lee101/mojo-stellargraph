@@ -1,6 +1,7 @@
 # Mojo dialect notes (verified by probe against the pinned compiler, not by docs)
 
-Toolchain these notes describe: `mojo ==1.1.0.dev2026081105`.
+Toolchain these notes describe: `mojo ==1.2.0.dev2026092605` (set in `MOJO_PIN` in
+`bin/port.sh`; every repo receives this file with the marker already substituted).
 Every claim below was checked by compiling it. `bin/probe-confirm.py` and
 `bin/probe-hints.py` in the factory regenerate the list; re-run them after any
 toolchain bump rather than trusting this file.
@@ -68,32 +69,111 @@ while i < n:                           # scalar tail
 - `p.unsafe_load(i)` for a scalar load; `p.unsafe_offset(i)[]` also works.
 - Positional `p[i]` still compiles but warns; prefer `unsafe_load`.
 
-## 4. Parallelism — REMOVED from the stdlib
+## 4. Parallelism — moved from `std` to `max`
 
-`parallelize` **does not exist** in this toolchain. It is not in `std.algorithm`
-(that module no longer even exports `sort`), not a builtin, and there is no
-`std.parallelism` / `std.threading`. The compiler offers no "did you mean" hint
-for it, which means it was removed rather than moved.
+`parallelize` is NOT gone. It moved package. On 1.2.0:
 
-Consequence: a port that parallelised on the CPU must either
-(a) keep the work serial and say so honestly in its benchmark table, or
-(b) find the replacement in the `max` package and verify it compiles.
-Do NOT write `from std.algorithm import parallelize` and assume it works.
+| import | result on 1.2.0 |
+| --- | --- |
+| `from max.algorithm import parallelize` | **WORKS** — this is the live path |
+| `from max.algorithm import sync_parallelize` | **WORKS** |
+| `from std.algorithm import parallelize` | `package 'algorithm' does not contain 'parallelize'` |
+| `from std.algorithm.functional import parallelize` | gone |
+| `from std.sys import parallelize` / `spawn` | `package 'sys' does not contain ...` |
+| `from std.threading import ...` | `unable to locate module 'threading'` |
+| `from std.algorithm import sort` | `package 'algorithm' does not contain 'sort'` |
 
-## 5. GPU — host API not present in the stdlib
+`std.algorithm` no longer exporting `sort` is the tell: the `std` module was gutted
+while the capability moved to `max`. So a port is parallelisable — just not through
+the old import. Verified by building `mojo-anndata` on 1.2.0: its
+`from max.algorithm import parallelize` compiles and the port builds.
 
-- `from std.gpu import thread_idx` **works**.
-- `from std.memory import stack_allocation` resolves, but its signature does not
-  match the old `stack_allocation[T](n)` form — check it by compiling.
-- **`DeviceContext` does not exist**: not in `std.gpu.host`, not in `std.gpu`, and
-  the compiler has no replacement to suggest. `ctx.enqueue_create_buffer`,
-  `enqueue_copy`, `enqueue_function` and `synchronize` are therefore unavailable
-  too. The `max` package ships GPU sources under
-  `site-packages/max/sys/_hal/`; look there if you need a device path.
+`max.parallel` and `max.core` do NOT exist; `max.algorithm` is the one.
 
-Practical rule: a GPU path is only worth writing if you can compile and run it.
-Otherwise state in the README that the port is CPU-only and why. The GPU is shared
-with production workloads — see the memory limits in `prompts/accel.md`.
+Do NOT write `from std.algorithm import parallelize` — it does not compile. If a
+port is serial where it could be parallel, that is a real gap, not a toolchain
+excuse; use the `max` form behind a size threshold and prove it with the benchmark.
+
+## 5. GPU — the host API moved from `std.gpu` to `max.gpu`
+
+Same story as parallelism. The `std.gpu` module is gone entirely
+(`unable to locate module 'gpu'`), so `from std.gpu import thread_idx` no longer
+resolves — but the capability is not gone with it:
+
+```mojo
+from max.gpu import block_idx, thread_idx      # WORKS
+from max.gpu.host import DeviceContext         # WORKS
+```
+
+and the full host surface is present and compiles on 1.2.0:
+
+- `ctx.enqueue_create_buffer[DType.float64](count)`
+- `ctx.enqueue_copy(dst, src)`
+- `ctx.enqueue_function[kernel](...)`
+- `ctx.synchronize()`
+- `ctx.name()`
+
+`DeviceContext()` construction needs a `raises` context (`def main() raises:`), and
+`DeviceContext` is not `Writable`, so do not `print` it. There is no
+`ctx.devices()`; enumerate through the `max.gpu` module instead.
+
+Verified end to end: `mojo-numba` and `mojo-imagehash` carry working `max.gpu.host`
+GPU paths and both build on 1.2.0.
+
+- `from std.memory import stack_allocation` resolves, but the old
+  `stack_allocation[T](n)` form does NOT: it fails with
+  `no matching function in call to 'stack_allocation'`. Check the signature by
+  compiling rather than assuming the historic shape.
+
+Practical rule: a GPU path is only worth shipping if you can compile AND run it,
+and the rules in `prompts/accel.md` about launch count, single copy-in/copy-out and
+tail coverage all still apply. The GPU is shared with production workloads — see
+the memory limits there. A CPU-only port is a legitimate answer when a kernel is
+below roughly 2 flops per byte, but "the host API is missing" is NOT a valid
+reason: it is in `max`, and 28 ports already use it.
+
+## 5b. Calling the `max` APIs — the details that actually bite
+
+These were each verified by compiling and running, across several ports. They are
+the difference between a one-line import fix and an afternoon.
+
+**The `max` conda package is required.** `max.mojoc` / `algorithm.mojoc` ship in
+`<prefix>/lib/mojo` from the `max` package, not from `mojo`. Without it the
+`max.*` imports fail with `unable to locate module 'max'`. Add it beside the mojo
+pin; it is released in lockstep, so `mojo ==X` goes with `max ==matching-version`:
+
+```toml
+[dependencies]
+mojo = "==1.2.0.dev2026092605"
+max  = "==26.7.0.dev2026092605"
+```
+
+**`parallelize` signature changed.** The bracket form no longer type-checks:
+
+- `parallelize(func, num_work_items, num_workers[, ctx])` — WORKS
+- `parallelize(func, num_work_items[, ctx])` — WORKS
+- `parallelize[func](n)` — does NOT type-check; the `[func]` form now binds the
+  origins overload.
+
+**The worker must be a plain `def`, not a `@parameter` closure.** `func` has to
+convert to `def(Int) -> None`, so a `@parameter def work(i: Int)` is rejected as
+`capturing thin`. Use a nested `def work(i: Int) {imm}:`. Nested `{imm}` calling
+nested `{imm}` also works, which the chunked variants need.
+
+**Pass an explicit worker count.** The 2-arg form crashed worker launch when
+called from a ctypes host. `sync_parallelize` segfaulted from a ctypes host
+entirely; prefer `parallelize` with an explicit count, and gate it behind a size
+threshold.
+
+**`max.gpu` exports** `block_dim`, `block_idx`, `thread_idx`, `global_idx`.
+`DeviceContext()` construction needs a `raises` context, the value is not
+`Writable` (do not `print` it), and there is no `ctx.devices()`.
+
+One trap worth naming: `max`'s caching memory allocator can request a very large
+chunk (mojo-eigen's batched GPU SVD asks for 16.75 GiB and gets
+`CUDA_ERROR_OUT_OF_MEMORY`) and a broad `except` will swallow that into a silent
+CPU fallback. If a GPU path "works" but never reports `used_gpu=1`, it is probably
+running on the CPU — check rather than assume.
 
 ## 6. Build
 
