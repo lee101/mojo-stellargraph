@@ -16,9 +16,9 @@ itself is unchanged.
 argument here and `power_iteration` supplies it.
 """
 
-from std.math import sqrt
+from std.math import sin, sqrt
 
-from mojostellargraph.types import FPtr, dot
+from mojostellargraph.types import FPtr, Vec, W, dot
 
 # Upstream dispatches on the `method` string; the C ABI carries a code and
 # python/mojostellargraph/core_utils.py maps the string onto it.
@@ -58,6 +58,19 @@ def add_self_loops(adj: FPtr, dst: FPtr, n: Int):
             dst.unsafe_store(i * n + j, v)
 
 
+
+def _inv_sqrt(x: Float64) -> Float64:
+    """`x ** -0.5` with upstream's sparse result for an isolated node: SciPy's
+    `diags` product only visits stored entries, so a zero row sum leaves a zero
+    row and a zero column, not an `inf * 0 = NaN` row."""
+    return 1.0 / sqrt(x) if x > 0.0 else 0.0
+
+
+def _inv(x: Float64) -> Float64:
+    """`x ** -1`, with the same treatment of a zero row sum."""
+    return 1.0 / x if x > 0.0 else 0.0
+
+
 def normalize_adj(adj: FPtr, dst: FPtr, d: FPtr, n: Int, symmetric: Int):
     """Upstream `normalize_adj(adj, symmetric=True)`.
 
@@ -81,14 +94,15 @@ def normalize_adj(adj: FPtr, dst: FPtr, d: FPtr, n: Int, symmetric: Int):
         d.unsafe_store(i, s)
     if symmetric:
         for i in range(n):
-            var di = 1.0 / sqrt(d.unsafe_load(i))
+            var di = _inv_sqrt(d.unsafe_load(i))
             for j in range(n):
                 dst.unsafe_store(
-                    i * n + j, adj.unsafe_load(j * n + i) * di * (1.0 / sqrt(d.unsafe_load(j)))
+                    i * n + j,
+                    adj.unsafe_load(j * n + i) * di * _inv_sqrt(d.unsafe_load(j)),
                 )
     else:
         for i in range(n):
-            var di = 1.0 / d.unsafe_load(i)
+            var di = _inv(d.unsafe_load(i))
             for j in range(n):
                 dst.unsafe_store(i * n + j, di * adj.unsafe_load(i * n + j))
 
@@ -118,7 +132,9 @@ def rescale_laplacian(laplacian: FPtr, dst: FPtr, n: Int, largest_eigval: Float6
     `eigsh(laplacian, 1, which="LM")` and substitutes `2.0` when ARPACK does
     not converge. Use `power_iteration` for the same quantity.
     """
-    var scale = 2.0 / largest_eigval
+    # upstream substitutes `largest_eigval = 2` when ARPACK fails to converge,
+    # and `power_iteration` reports failure as 0.0; both give a scale of 1.0
+    var scale = 2.0 / largest_eigval if largest_eigval > 0.0 else 1.0
     for i in range(n):
         for j in range(n):
             var v = scale * laplacian.unsafe_load(i * n + j)
@@ -137,8 +153,10 @@ def power_iteration(
     algorithm from ARPACK, so this is a documented numerical divergence rather
     than a like-for-like port; the eigenvalue it returns is the same one.
     """
+    # A constant start vector is an exact null vector of the normalized
+    # Laplacian of a regular graph, which would stall the iteration at 0.0.
     for i in range(n):
-        vec.unsafe_store(i, 1.0 / sqrt(Float64(n)))
+        vec.unsafe_store(i, sin(Float64(i) + 1.0) / sqrt(Float64(n)))
     var eigval = 0.0
     for _ in range(max_iter):
         dot(a, vec, work, n, n, 1)
@@ -175,6 +193,11 @@ def chebyshev_polynomial(x: FPtr, result: FPtr, work: FPtr, n: Int, k: Int):
     the Python side hands them back as a list of views. `work` is one `n * n`
     block used for the `X_.dot(...)` product.
     """
+    # `sp.eye(n)`, not a bare diagonal write: `result` is the caller's buffer.
+    var z = 0
+    while z < n * n:
+        result.unsafe_store(z, 0.0)
+        z += 1
     for i in range(n):
         result.unsafe_store(i * n + i, 1.0)
     var j = 0
@@ -186,18 +209,24 @@ def chebyshev_polynomial(x: FPtr, result: FPtr, work: FPtr, n: Int, k: Int):
         var prev = (step - 2) * n * n
         var cur = (step - 1) * n * n
         var next = step * n * n
+        # `T_k = 2 * X.dot(T_k_minus_one) - T_k_minus_two`, as the shared
+        # `dot` and one more pass over the `[n, n]` block
+        dot(x, result.unsafe_offset(cur), work, n, n, n)
         for r in range(n):
-            for c in range(n):
-                var acc = 0.0
-                for t in range(n):
-                    acc += x.unsafe_load(r * n + t) * result.unsafe_load(cur + t * n + c)
-                work.unsafe_store(r * n + c, acc)
-        for r in range(n):
-            for c in range(n):
-                result.unsafe_store(
-                    next + r * n + c,
-                    2.0 * work.unsafe_load(r * n + c) - result.unsafe_load(prev + r * n + c),
+            var wrow = work.unsafe_offset(r * n)
+            var prow = result.unsafe_offset(prev + r * n)
+            var nrow = result.unsafe_offset(next + r * n)
+            var j = 0
+            while j + W <= n:
+                nrow.unsafe_store(
+                    j,
+                    Vec(2.0) * wrow.unsafe_load[width=W](j)
+                    - prow.unsafe_load[width=W](j),
                 )
+                j += W
+            while j < n:
+                nrow.unsafe_store(j, 2.0 * wrow.unsafe_load(j) - prow.unsafe_load(j))
+                j += 1
 
 
 def invert(a: FPtr, dst: FPtr, work: FPtr, n: Int) -> Int:
@@ -239,18 +268,30 @@ def invert(a: FPtr, dst: FPtr, work: FPtr, n: Int) -> Int:
                 work.unsafe_store(col * w + j, work.unsafe_load(piv * w + j))
                 work.unsafe_store(piv * w + j, t)
         var d = work.unsafe_load(col * w + col)
-        for j in range(w):
-            work.unsafe_store(col * w + j, work.unsafe_load(col * w + j) / d)
+        var crow = work.unsafe_offset(col * w)
+        var j = 0
+        while j + W <= w:
+            crow.unsafe_store(j, crow.unsafe_load[width=W](j) / d)
+            j += W
+        while j < w:
+            crow.unsafe_store(j, crow.unsafe_load(j) / d)
+            j += 1
         for r in range(n):
             if r == col:
                 continue
             var f = work.unsafe_load(r * w + col)
             if f == 0.0:
                 continue
-            for j in range(w):
-                work.unsafe_store(
-                    r * w + j, work.unsafe_load(r * w + j) - f * work.unsafe_load(col * w + j)
+            var rrow = work.unsafe_offset(r * w)
+            j = 0
+            while j + W <= w:
+                rrow.unsafe_store(
+                    j, rrow.unsafe_load[width=W](j) - f * crow.unsafe_load[width=W](j)
                 )
+                j += W
+            while j < w:
+                rrow.unsafe_store(j, rrow.unsafe_load(j) - f * crow.unsafe_load(j))
+                j += 1
 
     for i in range(n):
         for j in range(n):

@@ -29,6 +29,9 @@ class MeanHinAggregator:
         if activation not in _acts.CODES:
             raise ValueError("unsupported activation {!r}".format(activation))
         self.output_dim = int(output_dim)
+        # `assert output_dim % 2 == 0`, upstream: the kernel packs the
+        # concatenated self and neighbour halves into `2 * half` columns
+        assert self.output_dim % 2 == 0
         self.half_output_dim = self.output_dim // 2
         self.nr = int(nr)
         self.act = activation
@@ -89,31 +92,71 @@ class HinSAGE:
     HinSAGE, the heterogeneous GraphSAGE of Hu et al.
 
     ```
-    HinSAGE(layer_sizes, generator, nr, activation="relu", bias=True)
+    HinSAGE(layer_sizes, generator, nr, activation="relu", bias=True,
+            normalize="l2", activations=None)
     ```
 
     `__call__` applies one `MeanHinAggregator` per layer, in the layer order
-    `layer_sizes` gives.
+    `layer_sizes` gives, then upstream's optional `l2` normalization over the
+    last axis.
     """
 
     def __init__(self, layer_sizes, generator, nr, activation: str = "relu",
-                 bias: bool = True, **kwargs):
+                 bias: bool = True, normalize: str | None = "l2",
+                 activations=None, **kwargs):
         self.layer_sizes = list(layer_sizes)
         self.generator = generator
         self.nr = int(nr)
         self.activation = activation
         self.bias = bool(bias)
+        if normalize == "l2":
+            self.normalize = "l2"
+        elif normalize in (None, "none", "None"):
+            self.normalize = None
+        else:
+            raise ValueError(
+                "Normalization should be either 'l2' or 'none'; received "
+                "'{}'".format(normalize)
+            )
+        # `activations = ["relu"] * (n_layers - 1) + ["linear"]` upstream: the
+        # last layer is linear, so a plain `activation` string only sets the
+        # hidden layers
+        if activations is None:
+            acts = [activation] * (len(self.layer_sizes) - 1) + ["linear"]
+        elif len(activations) != len(self.layer_sizes):
+            raise ValueError(
+                "Invalid number of activations; require one function per layer"
+            )
+        else:
+            acts = list(activations)
+        for a in acts:
+            if a not in _acts.CODES:
+                raise ValueError("unsupported activation {!r}".format(a))
+        self.activations = acts
         self._aggs = []
 
     def build(self, dims, seed: int = 0):
         """`dims[layer]` is `(d_self, d_neigh)` for that layer."""
         self._aggs = [
-            MeanHinAggregator(size, self.nr, self.activation, self.bias).build(
+            MeanHinAggregator(size, self.nr, self.activations[i], self.bias).build(
                 dims[i][0], dims[i][1], seed + i
             )
             for i, size in enumerate(self.layer_sizes)
         ]
         return self
+
+    def _normalization(self, x):
+        """`K.l2_normalize(x, axis=-1)`, upstream's `self._normalization`."""
+        x = np.ascontiguousarray(f64(x))
+        if self.normalize is None:
+            return x
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        dst = np.zeros_like(flat)
+        lib().msg_GraphSAGE_normalization(
+            addr(flat), addr(dst), flat.shape[0], flat.shape[1], 1
+        )
+        return dst.reshape(shape)
 
     def __call__(self, head, neighbourhoods):
         """`head` is the `[n_batch, n_head, d_self]` self tensor and
@@ -131,4 +174,4 @@ class HinSAGE:
         h = head
         for agg, rel in zip(self._aggs, neighbourhoods):
             h = agg(h, rel)
-        return h
+        return self._normalization(h)

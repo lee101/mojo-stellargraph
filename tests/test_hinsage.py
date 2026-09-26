@@ -99,11 +99,19 @@ def test_mean_hin_aggregator_halves_are_independent(r):
 
 def test_mean_hin_aggregator_output_width_is_twice_the_half(r):
     """`half_output_dim = output_dim // 2`; the two halves are concatenated."""
-    for out in (8, 9, 12):
+    for out in (8, 12):
         agg = built(r, out=out)
         assert agg.half_output_dim == out // 2
         got = agg.call(head(r), neigh(r))
         assert got.shape == (B, H, out)
+
+
+def test_mean_hin_aggregator_rejects_an_odd_output_width(r):
+    """Upstream's `assert output_dim % 2 == 0`: the kernel concatenates a
+    `half_output_dim` self block and a `half_output_dim` neighbour block, so an
+    odd width has no such split."""
+    with pytest.raises(AssertionError):
+        sg.MeanHinAggregator(9, NR)
 
 
 def test_mean_hin_aggregator_build_shapes(r):
@@ -195,12 +203,50 @@ def test_hinsage_model_shape_and_oracle_parity(r):
     head_in = head(r)
     nbrs = [neigh(r), r.normal(size=(NR, B, H, 2, OUT))]
     got = m(head_in, nbrs)
-    h = head_in
-    for agg, rel in zip(m._aggs, nbrs):
-        h = ref.mean_hin_aggregator_call(
-            h, rel, agg.w_self, agg.w_neigh, agg.bias, agg.act)
+    h = ref.hinsage_model_call(head_in, nbrs, m._aggs, m.normalize)
     assert got.shape == (B, H, OUT)
     assert np.abs(got - h).max() < ACT_ATOL
+
+
+def test_hinsage_normalizes_by_default(r):
+    """Upstream's default is `normalize="l2"`, applied as
+    `K.l2_normalize(x, axis=-1)` after the aggregator chain."""
+    m = sg.HinSAGE([OUT], None, NR, "linear", True).build(
+        [(D_SELF, D_NEIGH)], seed=0
+    )
+    got = m(head(r), [neigh(r)])
+    np.testing.assert_allclose(
+        np.linalg.norm(got, axis=-1), 1.0, rtol=0, atol=1e-9
+    )
+
+
+def test_hinsage_normalize_none_is_the_identity(r):
+    m = sg.HinSAGE([OUT], None, NR, "linear", True, normalize=None).build(
+        [(D_SELF, D_NEIGH)], seed=0
+    )
+    x_self, x_neigh = head(r), neigh(r)
+    np.testing.assert_array_equal(
+        m(x_self, [x_neigh]), m._aggs[0].call(x_self, x_neigh)
+    )
+
+
+def test_hinsage_rejects_an_unknown_normalization(r):
+    with pytest.raises(ValueError):
+        sg.HinSAGE([OUT], None, NR, "linear", True, normalize="l1")
+
+
+def test_hinsage_leaves_the_last_layer_linear(r):
+    """Upstream's `activations = ["relu"] * (n_layers - 1) + ["linear"]`: the
+    last layer's output is not passed through a nonlinearity."""
+    m = sg.HinSAGE([OUT, OUT], None, NR, "relu", True)
+    m.build([(D_SELF, D_NEIGH), (OUT, OUT)], seed=0)
+    assert m.activations == ["relu", "linear"]
+    assert [a.act for a in m._aggs] == ["relu", "linear"]
+
+
+def test_hinsage_rejects_mismatched_activation_counts(r):
+    with pytest.raises(ValueError):
+        sg.HinSAGE([OUT, OUT], None, NR, "relu", True, activations=["relu"])
 
 
 def test_hinsage_layer_widths_follow_the_layer_sizes(r):
@@ -216,8 +262,9 @@ def test_hinsage_layer_widths_follow_the_layer_sizes(r):
 
 
 def test_hinsage_is_the_aggregation_chain(r):
-    """`HinSAGE` is one `MeanHinAggregator` per layer, applied in order."""
-    m = sg.HinSAGE([OUT, OUT], None, NR, "relu", True)
+    """`HinSAGE` is one `MeanHinAggregator` per layer, applied in order, then
+    the normalization."""
+    m = sg.HinSAGE([OUT, OUT], None, NR, "relu", True, normalize=None)
     m.build([(D_SELF, D_NEIGH), (OUT, OUT)], seed=0)
     x_self = head(r)
     nbrs = [neigh(r), r.normal(size=(NR, B, H, 2, OUT))]

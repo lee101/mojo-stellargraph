@@ -86,11 +86,13 @@ def test_csr_from_edges_of_an_empty_graph():
 
 # ---------------------------------------------------------- uniform walks
 def _uniform_case(edges, n, nodes, n_walks, length, seed):
+    # upstream's `_check_nodes` rejects `nodes=None`, so "every node" is
+    # spelled out here rather than left to a default
+    roots = list(range(n)) if nodes is None else [int(v) for v in nodes]
     got = _as_ints(
-        sg.UniformRandomWalk(edges, n).run(nodes, n=n_walks, length=length, seed=seed)
+        sg.UniformRandomWalk(edges, n).run(roots, n=n_walks, length=length, seed=seed)
     )
     indptr, colind = sg.csr_from_edges(edges, n)
-    roots = list(range(n)) if nodes is None else [int(v) for v in nodes]
     want = ref.uniform_random_walk(indptr, colind, roots, n_walks, length, seed)
     return got, want
 
@@ -161,7 +163,7 @@ def test_uniform_random_walk_is_a_path_in_the_graph():
     adjacent = {(int(u), int(v)) for u, v in edges}
     for seed in (0, 1, 2):
         walks = _as_ints(
-            sg.UniformRandomWalk(edges, 12).run(None, n=4, length=6, seed=seed)
+            sg.UniformRandomWalk(edges, 12).run(list(range(12)), n=4, length=6, seed=seed)
         )
         for walk in walks:
             for a, b in zip(walk, walk[1:]):
@@ -170,13 +172,13 @@ def test_uniform_random_walk_is_a_path_in_the_graph():
 
 # ------------------------------------------------------------ biased walks
 def _biased_case(edges, n, nodes, n_walks, p, q, length, seed):
+    roots = list(range(n)) if nodes is None else [int(v) for v in nodes]
     got = _as_ints(
         sg.BiasedRandomWalk(edges, n).run(
-            nodes, n=n_walks, p=p, q=q, length=length, seed=seed
+            roots, n=n_walks, p=p, q=q, length=length, seed=seed
         )
     )
     indptr, colind = sg.csr_from_edges(edges, n)
-    roots = list(range(n)) if nodes is None else [int(v) for v in nodes]
     want = ref.biased_random_walk(indptr, colind, roots, n_walks, p, q, length, seed)
     return got, want
 
@@ -230,13 +232,50 @@ def test_biased_random_walk_weighted_is_not_implemented():
         )
 
 
+# ------------------------------------------- _check_common_parameters
+@pytest.mark.parametrize("walker", [sg.UniformRandomWalk, sg.BiasedRandomWalk])
+def test_walkers_reject_missing_root_nodes(walker):
+    """Upstream's `_check_nodes`: `nodes=None` is an error, not "every
+    node"."""
+    edges = _undirected_edges(6, 0.5, seed=7)
+    with pytest.raises(ValueError, match="root node IDs"):
+        walker(edges, 6).run(None, n=1, length=3, seed=0)
+
+
+@pytest.mark.parametrize("walker", [sg.UniformRandomWalk, sg.BiasedRandomWalk])
+@pytest.mark.parametrize("n", [0, -1, 1.5, "2"])
+def test_walkers_reject_a_non_positive_or_non_integer_n(walker, n):
+    """Upstream's `_check_repetitions`."""
+    edges = _undirected_edges(6, 0.5, seed=7)
+    with pytest.raises(ValueError, match="walks per root node"):
+        walker(edges, 6).run([0], n=n, length=3, seed=0)
+
+
+@pytest.mark.parametrize("walker", [sg.UniformRandomWalk, sg.BiasedRandomWalk])
+@pytest.mark.parametrize("length", [0, -3, 2.5])
+def test_walkers_reject_a_non_positive_or_non_integer_length(walker, length):
+    """Upstream's `_check_length`: length 0 is invalid by consensus."""
+    edges = _undirected_edges(6, 0.5, seed=7)
+    with pytest.raises(ValueError, match="walk length"):
+        walker(edges, 6).run([0], n=1, length=length, seed=0)
+
+
+@pytest.mark.parametrize("walker", [sg.UniformRandomWalk, sg.BiasedRandomWalk])
+@pytest.mark.parametrize("seed", [-1, 1.5, "3"])
+def test_walkers_reject_a_bad_seed(walker, seed):
+    """Upstream's `_check_seed`."""
+    edges = _undirected_edges(6, 0.5, seed=7)
+    with pytest.raises(ValueError, match="seed"):
+        walker(edges, 6).run([0], n=1, length=3, seed=seed)
+
+
 def test_biased_random_walk_is_a_path_in_the_graph():
     edges = _undirected_edges(12, 0.3, seed=3)
     adjacent = {(int(u), int(v)) for u, v in edges}
     for seed in (0, 1, 2):
         walks = _as_ints(
             sg.BiasedRandomWalk(edges, 12).run(
-                None, n=4, p=0.5, q=2.0, length=6, seed=seed
+                list(range(12)), n=4, p=0.5, q=2.0, length=6, seed=seed
             )
         )
         for walk in walks:
@@ -304,6 +343,16 @@ def test_naive_weighted_choices_rejects_a_negative_weight():
         ref.naive_weighted_choices([1.0, -0.5, 2.0], ref.LCG(0))
 
 
+def test_naive_weighted_choices_rejects_an_isolated_node():
+    """There is no interval to sample from at degree zero, and upstream's only
+    caller always passes at least one weight; returning the neighbour before
+    `indptr[node]` would read outside `colind`."""
+    edges = _star_edges(2)  # a 3-node star, so node 3 is isolated
+    indptr, colind = sg.csr_from_edges(edges, 4)
+    with pytest.raises(ValueError, match="no neighbours"):
+        sg.naive_weighted_choices((indptr, colind), [1.0], 3)
+
+
 def test_naive_weighted_choices_is_the_cumulative_weight_split():
     # the choice is `argmin{idx : u * total < running_total(idx)}`, so a
     # one-hot weight vector always lands in its own interval, whatever u is
@@ -333,7 +382,7 @@ def test_star_graph_walks_visit_the_hub_more_than_any_leaf():
     n = leaves + 1
     edges = _star_edges(leaves)
     walks = _as_ints(
-        sg.UniformRandomWalk(edges, n).run(None, n=200, length=6, seed=3)
+        sg.UniformRandomWalk(edges, n).run(list(range(n)), n=200, length=6, seed=3)
     )
     visits = _visit_counts(walks, n)
     assert visits[0] > visits[1:].max()
@@ -346,7 +395,7 @@ def test_star_graph_biased_walks_also_favour_the_hub():
     edges = _star_edges(leaves)
     walks = _as_ints(
         sg.BiasedRandomWalk(edges, n).run(
-            None, n=200, p=0.5, q=2.0, length=6, seed=3
+            list(range(n)), n=200, p=0.5, q=2.0, length=6, seed=3
         )
     )
     visits = _visit_counts(walks, n)
@@ -359,7 +408,7 @@ def test_star_graph_walk_nodes_and_lengths():
     n = leaves + 1
     edges = _star_edges(leaves)
     walks = _as_ints(
-        sg.UniformRandomWalk(edges, n).run(None, n=50, length=8, seed=1)
+        sg.UniformRandomWalk(edges, n).run(list(range(n)), n=50, length=8, seed=1)
     )
     assert len(walks) == 50 * n
     assert all(len(w) == 8 for w in walks)

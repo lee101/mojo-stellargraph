@@ -434,3 +434,45 @@ def test_flow_of_chebyshev_carries_the_stack(sym_graph, features):
     assert out_features is gen.features
     assert len(out_features) == 5
     assert out_adj is gen.Aadj
+
+
+def test_the_readme_usage_example_runs_and_says_what_it_says():
+    """The example in README.md, executed: the same shapes, the same softmax
+    rows and the same first walk."""
+    rng = np.random.default_rng(0)
+    n, d = 200, 32
+    edges = np.array(np.nonzero(rng.random((n, n)) < 0.03), dtype=np.int64).T
+    features = np.ascontiguousarray(rng.normal(size=(n, d)))
+
+    class Graph:
+        node_list = np.arange(n)
+        edge_array = edges
+        feature_array = features
+
+    gen = sg.FullBatchNodeGenerator(Graph(), method="gcn")
+    assert gen.Aadj.shape == (200, 200)
+    np.testing.assert_allclose(gen.Aadj, gen.Aadj.T, atol=1e-12)
+    np.testing.assert_allclose(np.diag(gen.Aadj), 1.0, atol=1e-12)
+
+    model = sg.GCN([16, 4], gen, activations=["elu", "softmax"])
+    model.build(d, seed=0)
+    out = model(features, gen.Aadj)
+    assert out.shape == (200, 4)
+    np.testing.assert_allclose(out.sum(axis=1), 1.0, atol=1e-9)
+
+    gen_gat = sg.FullBatchNodeGenerator(Graph(), method="gat")
+    gat = sg.GraphAttention(8, attn_heads=4, activation="softmax", final_layer=True)
+    gat.build(d)
+    gat.kernels[:] = rng.normal(size=(4, d, 8))
+    gat.attn_kernels[:] = rng.normal(size=(4, 16))
+    gat.biases[:] = rng.normal(size=(4, 8))
+    out = gat(features, gen_gat.Aadj, np.arange(50))
+    assert out.shape == (50, 32)
+
+    walks = sg.UniformRandomWalk(edges, n).run(nodes=[0, 1, 2], n=2, length=5, seed=7)
+    assert walks[0] == [0, 11, 118, 97, 50]
+    # a real path: every step is an edge of the graph
+    index = {tuple(sorted(e)) for e in edges}
+    for walk in walks:
+        for a, b in zip(walk, walk[1:]):
+            assert (a, b) in index or (b, a) in index

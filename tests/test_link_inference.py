@@ -342,13 +342,6 @@ def test_link_inference_inner_product_warns_once_not_twice():
     assert edge(x0, x1).shape == (7, 1)
 
 
-def test_link_inference_requires_a_kernel():
-    x0, x1 = _embeddings()
-    edge = sg.link_inference(edge_embedding_method="l1")
-    with pytest.raises(ValueError):
-        edge(x0, x1)
-
-
 def test_link_inference_rejects_mismatched_embedding_shapes():
     x0, x1 = _embeddings()
     with pytest.raises(ValueError):
@@ -357,23 +350,48 @@ def test_link_inference_rejects_mismatched_embedding_shapes():
         )(x0, np.ascontiguousarray(x1[:4]))
 
 
+@pytest.mark.parametrize("output_dim", [1, 5, 8, 16])
+def test_dense_arm_accepts_an_output_wider_than_the_embeddings(output_dim):
+    """`Dense(output_dim)` is legal at any width, including one wider than the
+    `2 * d` the edge embedding occupies; the port's scratch must cover both."""
+    x0, x1 = _embeddings()
+    d = x0.shape[1]
+    edge = sg.link_inference(
+        output_dim=output_dim,
+        output_act="relu",
+        edge_embedding_method="l1",
+        kernel=_kernel(d, output_dim, 3),
+    )
+    got = edge(x0, x1)
+    want = np.maximum(np.abs(x0 - x1) @ _kernel(d, output_dim, 3), 0.0)
+    assert got.shape == (x0.shape[0], output_dim)
+    np.testing.assert_allclose(got, want, rtol=0, atol=1e-12)
+
+
 # --------------------------------------------------------- the two factories
 def test_link_classification_defaults():
     edge = sg.link_classification()
     assert _free(edge, "output_dim") == 1
     assert _free(edge, "output_act") == "sigmoid"
-    assert _free(edge, "edge_embedding_method") == "ip"
     assert _free(edge, "clip") == 0
     assert sg.link_classification.__defaults__ == (1, "sigmoid", "ip")
+    # the default `ip` arm is `Activation("sigmoid")(K.sum(x0 * x1, -1))`
+    x0, x1 = _embeddings()
+    want = 1.0 / (1.0 + np.exp(-(x0 * x1).sum(axis=1)))
+    np.testing.assert_allclose(edge(x0, x1).ravel(), want, rtol=0, atol=1e-12)
 
 
 def test_link_regression_defaults():
     edge = sg.link_regression()
     assert _free(edge, "output_dim") == 1
     assert _free(edge, "output_act") == "linear"
-    assert _free(edge, "edge_embedding_method") == "ip"
     assert _free(edge, "clip") == 0
     assert sg.link_regression.__defaults__ == (1, None, "ip")
+    # `linear` is the identity on the inner product
+    x0, x1 = _embeddings()
+    np.testing.assert_allclose(
+        edge(x0, x1).ravel(), (x0 * x1).sum(axis=1), rtol=0, atol=1e-12
+    )
 
 
 def test_link_classification_reports_its_name(capsys):
@@ -386,12 +404,63 @@ def test_link_regression_reports_its_name(capsys):
     assert "link_regression" in capsys.readouterr().out
 
 
-def test_the_factories_never_supply_a_kernel():
-    # both factories leave `kernel=None`, so calling the returned edge function
-    # is a ValueError rather than a silently glorot-initialised Dense
+def test_the_ip_arm_needs_no_kernel():
+    # upstream's `ip`/`dot` arm is `K.sum` + `Activation` + `Reshape`, with no
+    # `Dense`, so both factories are callable with no weights at all
     x0, x1 = _embeddings()
-    for factory in (sg.link_classification, sg.link_regression):
+    for factory, act in (
+        (sg.link_classification, lambda z: 1.0 / (1.0 + np.exp(-z))),
+        (sg.link_regression, lambda z: z),
+    ):
         edge = factory()
-        assert _free(edge, "kernel") is None
+        want = act((x0 * x1).sum(axis=1))
+        np.testing.assert_allclose(edge(x0, x1).ravel(), want, rtol=0, atol=1e-12)
+
+
+def test_a_dense_arm_rejects_a_missing_kernel():
+    # every arm but `ip`/`dot` applies a `Dense`, which upstream builds at
+    # `link_inference()` time; the width is not known before the call, so the
+    # port asks for the kernel there rather than inventing one
+    with pytest.raises(ValueError):
+        sg.link_inference(output_dim=1, edge_embedding_method="l1")
+    for method in ("l2", "mul", "hadamard", "concat", "avg"):
         with pytest.raises(ValueError):
-            edge(x0, x1)
+            sg.link_inference(output_dim=1, edge_embedding_method=method)
+
+
+def test_ip_with_a_softmax_output_normalizes_per_row():
+    """The documented divergence: upstream reduces `ip`/`dot` to a rank-1
+    length-`n` tensor, so `Activation("softmax")` spreads across the `n` edges
+    and the `Reshape((1,))` after it then fails. The port's softmax runs over
+    the width-1 output column, so each row is 1.0. Every other activation is
+    elementwise and agrees exactly with the oracle."""
+    fn = sg.link_inference(
+        output_dim=1, output_act="softmax", edge_embedding_method="ip"
+    )
+    r = np.random.default_rng(3)
+    x0 = r.normal(size=(5, 4))
+    x1 = r.normal(size=(5, 4))
+    got = fn(x0, x1)
+    assert got.shape == (5, 1)
+    np.testing.assert_allclose(got, np.ones((5, 1)), atol=1e-12, rtol=0.0)
+
+
+def test_softmax_output_on_a_wide_arm_is_a_normalized_distribution():
+    """The softmax is the one output activation that is not elementwise, so it
+    is checked against the oracle rather than skipped."""
+    kernel = np.random.default_rng(5).normal(size=(8, 3))
+    fn = sg.link_inference(
+        output_dim=3,
+        output_act="softmax",
+        edge_embedding_method="hadamard",
+        kernel=kernel,
+    )
+    r = np.random.default_rng(6)
+    x0 = r.normal(size=(7, 8))
+    x1 = r.normal(size=(7, 8))
+    got = fn(x0, x1)
+    exp = ref.link_inference(
+        x0, x1, kernel, output_dim=3, output_act="softmax",
+        edge_embedding_method="hadamard",
+    )
+    np.testing.assert_allclose(got, exp, atol=1e-9, rtol=0.0)

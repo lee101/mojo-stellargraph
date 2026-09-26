@@ -104,32 +104,34 @@ def link_inference(
         )
         output_dim = 1
 
-    kernel_rows = None
+    # `ip`/`dot` is the one arm with no Dense upstream, so it needs no kernel.
+    needs_dense = method not in (METHODS["ip"], METHODS["dot"])
+    if not needs_dense and kernel is None:
+        # the kernel pointer is non-nullable at the C ABI, so a one-element
+        # placeholder crosses; the `ip`/`dot` arm never reads it
+        kernel = np.zeros((1, output_dim))
 
+    kernel_rows = None
     if kernel is None:
-        # a glorot-uniform Dense, as `Dense(output_dim, activation=...)` builds
-        bias = np.zeros(output_dim) if bias is None else f64(bias).reshape(-1)
-    else:
-        kernel = np.atleast_2d(f64(kernel))
-        if kernel.ndim != 2 or kernel.shape[1] != output_dim:
-            raise ValueError(
-                "kernel must have shape (in_dim, output_dim={}), got {}".format(
-                    output_dim, kernel.shape
-                )
+        raise ValueError(
+            "'{}' needs an explicit kernel: the embedding width is only "
+            "known at call time".format(edge_embedding_method)
+        )
+    kernel = np.atleast_2d(f64(kernel))
+    if kernel.ndim != 2 or kernel.shape[1] != output_dim:
+        raise ValueError(
+            "kernel must have shape (in_dim, output_dim={}), got {}".format(
+                output_dim, kernel.shape
             )
-        bias = np.zeros(output_dim) if bias is None else f64(bias).reshape(-1)
-        kernel_rows = int(kernel.shape[0])
-        kernel = np.ascontiguousarray(kernel).reshape(-1)
+        )
+    bias = np.zeros(output_dim) if bias is None else f64(bias).reshape(-1)
+    kernel_rows = int(kernel.shape[0])
+    kernel = np.ascontiguousarray(kernel).reshape(-1)
     clip = 1 if clip_limits is not None else 0
     clip_low = float(clip_limits[0]) if clip_limits is not None else 0.0
     clip_high = float(clip_limits[1]) if clip_limits is not None else 0.0
 
     def edge_function(x0, x1) -> np.ndarray:
-        if kernel is None:
-            raise ValueError(
-                "'{}' needs an explicit kernel: the embedding width is only "
-                "known at call time".format(edge_embedding_method)
-            )
         x0 = f64(x0)
         x1 = f64(x1)
         if x0.shape != x1.shape:
@@ -138,8 +140,10 @@ def link_inference(
                 "got {} and {}".format(x0.shape, x1.shape)
             )
         n, d = x0.shape
-        want = 2 * d if method == 5 else d
-        if kernel_rows is not None and kernel_rows != want:
+        want = 2 * d if method == METHODS["concat"] else d
+        # the `ip`/`dot` arm has no Dense, so its placeholder kernel carries no
+        # input-width contract
+        if needs_dense and kernel_rows != want:
             # `Dense` rejects the shape at build time; the embedding width is
             # only known here, so the check happens here
             raise ValueError(
@@ -147,7 +151,10 @@ def link_inference(
                     kernel_rows, want
                 )
             )
-        le = np.zeros((n, 2 * d), dtype=np.float64)
+        # `le` is the `2 * d` concat buffer, and the activation and the
+        # LeakyClippedLinear run over the `n * output_dim` result through it, so
+        # it has to be at least that wide
+        le = np.zeros((n, max(2 * d, output_dim, 1)), dtype=np.float64)
         result = np.zeros((n, max(output_dim, 1)), dtype=np.float64)
         width = lib().msg_link_inference_edge_function(
             addr(x0), addr(x1), addr(le), addr(kernel), addr(bias), addr(result),

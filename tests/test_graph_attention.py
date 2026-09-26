@@ -241,6 +241,46 @@ def test_dense_gather_repeats_a_row_for_a_repeated_index(adj_with_loops, feature
     np.testing.assert_allclose(got, full[repeated], rtol=0, atol=ATOL)
 
 
+@pytest.mark.parametrize("m", [1, 40, 90])
+def test_dense_gather_length_is_unconstrained_by_the_node_count(
+    adj_with_loops, features, m
+):
+    """`K.gather` bounds nothing: upstream's `out_indices_t` is
+    `Input(batch_shape=(1, None))`, so the index list may be longer than the
+    node set. Every index must still yield one output row, in order."""
+    n = features.shape[0]
+    indices = (np.arange(m, dtype=np.int64) * 5) % n
+    layer = _layer(sg.GraphAttention, 7, 4, 2, "concat", "relu", True,
+                   final_layer=True, seed=22)
+    got = layer(features, adj_with_loops, indices.astype(np.int32))
+    ak = layer.attn_kernels.reshape(2, 2, 4)
+    full = ref.graph_attention_call(
+        features, adj_with_loops, layer.kernels, ak, layer.biases, 2, "concat", "relu",
+        False, None, False, 1.0, 0.0,
+    )
+    assert got.shape == (m, 8)
+    np.testing.assert_allclose(got, full[indices], rtol=0, atol=ATOL)
+
+
+@pytest.mark.parametrize("m", [1, 40, 90])
+def test_sparse_gather_length_is_unconstrained_by_the_node_count(
+    adj_with_loops, features, m
+):
+    n = features.shape[0]
+    indices = (np.arange(m, dtype=np.int64) * 5) % n
+    layer = _layer(sg.GraphAttentionSparse, 7, 4, 2, "concat", "relu", True,
+                   final_layer=True, seed=22)
+    got = layer(features, sg.SparseTensor.from_dense(adj_with_loops),
+                indices.astype(np.int32))
+    ak = layer.attn_kernels.reshape(2, 2, 4)
+    full = ref.graph_attention_call(
+        features, adj_with_loops, layer.kernels, ak, layer.biases, 2, "concat", "relu",
+        False, None, False, 1.0, 0.0,
+    )
+    assert got.shape == (m, 8)
+    np.testing.assert_allclose(got, full[indices], rtol=0, atol=ATOL)
+
+
 def test_dense_ignores_indices_when_not_the_final_layer(adj_with_loops, features):
     layer = _layer(sg.GraphAttention, 7, 4, 1, "concat", "relu", True, final_layer=False, seed=13)
     got = layer(features, adj_with_loops, OUT_INDICES)

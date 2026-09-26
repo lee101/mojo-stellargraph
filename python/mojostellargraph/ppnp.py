@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import activations as _acts
-from ._lib import addr, f64, i32, lib
+from ._lib import addr, f64, lib, node_indices
 
 
 class PPNPPropagationLayer:
@@ -36,11 +36,15 @@ class PPNPPropagationLayer:
         features = f64(features)
         A = f64(A)
         n, f = features.shape
+        if A.shape != (n, n):
+            raise ValueError(
+                "adjacency must be ({}, {}), got {}".format(n, n, A.shape)
+            )
         # `out_indices=None` means no gather at all, so a final layer keeps
         # every node rather than gathering node 0
         if out_indices is None:
             out_indices = np.zeros(0, dtype=np.int32)
-        out_indices = i32(np.asarray(out_indices).reshape(-1))
+        out_indices = node_indices(out_indices, n)
         m = int(out_indices.shape[0])
         result = np.zeros((n, f), dtype=np.float64)
         gathered = np.zeros((max(m, 1), f), dtype=np.float64)
@@ -69,6 +73,11 @@ class PPNP:
 
     def __init__(self, layer_sizes, activations, generator, bias: bool = True,
                  dropout: float = 0.0, kernel_regularizer=None):
+        from .node_mappers import FullBatchNodeGenerator
+
+        if not isinstance(generator, FullBatchNodeGenerator):
+            raise TypeError("Generator should be a instance of FullBatchNodeGenerator")
+
         if not len(layer_sizes) == len(activations):
             raise ValueError(
                 "The number of layers should equal the number of activations"

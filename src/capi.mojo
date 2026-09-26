@@ -408,18 +408,15 @@ def msg_AttentionalAggregator_call(
     sources: Int,
     bias: Int,
     result: Int,
-    work: Int,
     b: Int,
     h: Int,
-    n_groups: Int,
-    out_dim: Int,
+    width: Int,
     has_bias: Int,
     act: Int,
     alpha: Float64,
 ) abi("C"):
     AttentionalAggregator_call(
-        f(sources), f(bias), f(result), f(work), b, h, n_groups, out_dim,
-        has_bias, act, alpha,
+        f(sources), f(bias), f(result), b, h, width, has_bias, act, alpha
     )
 
 
@@ -428,17 +425,15 @@ def msg_GraphSAGEAggregator_call(
     sources: Int,
     bias: Int,
     result: Int,
-    work: Int,
     b: Int,
     h: Int,
-    n_groups: Int,
-    out_dim: Int,
+    width: Int,
     has_bias: Int,
     act: Int,
     alpha: Float64,
 ) abi("C"):
     GraphSAGEAggregator_call(
-        f(sources), f(bias), f(result), f(work), b, h, n_groups, out_dim, has_bias, act, alpha
+        f(sources), f(bias), f(result), b, h, width, has_bias, act, alpha
     )
 
 
@@ -589,10 +584,10 @@ def msg_link_inference_edge_function(
 # ------------------------------------- stellargraph/data/explorer.py
 @export("msg_naive_weighted_choices")
 def msg_naive_weighted_choices(
-    indptr: Int, colind: Int, weights: Int, work: Int, node: Int, state: Int
+    indptr: Int, colind: Int, weights: Int, work: Int, node: Int, state: UInt64
 ) abi("C") -> Int:
     return naive_weighted_choices(
-        i(indptr), i(colind), f(weights), f(work), node, UInt64(state)
+        i(indptr), i(colind), f(weights), f(work), node, state
     )
 
 
@@ -670,12 +665,26 @@ def msg_coo_to_csr(
     cursor: Int,
     e: Int,
     n: Int,
-) abi("C"):
-    coo_to_csr(i(rows), i(cols), f(values), i(indptr), i(colind), f(result), i(cursor), e, n)
+    ncols: Int,
+) abi("C") -> Int:
+    # 0 means an index outside the dense shape, which is an out-of-bounds access.
+    return coo_to_csr(
+        i(rows), i(cols), f(values), i(indptr), i(colind), f(result), i(cursor),
+        e, n, ncols,
+    )
 
 
 @export("msg_sparse_dense_matmul")
 def msg_sparse_dense_matmul(
-    indptr: Int, colind: Int, values: Int, dense: Int, dst: Int, n: Int, d: Int
+    indptr: Int,
+    colind: Int,
+    values: Int,
+    dense: Int,
+    dst: Int,
+    n: Int,
+    d: Int,
+    dense_rows: Int,
 ) abi("C"):
-    sparse_dense_matmul(i(indptr), i(colind), f(values), f(dense), f(dst), n, d)
+    sparse_dense_matmul(
+        i(indptr), i(colind), f(values), f(dense), f(dst), n, d, dense_rows
+    )

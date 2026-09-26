@@ -40,9 +40,13 @@ def sparse_dense_matmul(
     dst: FPtr,
     n: Int,
     d: Int,
+    dense_rows: Int,
 ):
-    """`tf.sparse.matmul(a, b)` with `a` in row-major `SparseTensor` form and
-    `b` dense `[n, d]`, giving a dense `[n, d]` result."""
+    """`tf.sparse.matmul(a, b)` with `a` in row-major `SparseTensor` form,
+    `b` dense `[dense_rows, d]` and a result dense `[n, d]`.
+
+    `dense_rows` is `a`'s column count, which is the row stride of `b` and is
+    not `d` unless the product happens to be square."""
     for r in range(n):
         for c in range(d):
             var acc = 0.0
@@ -50,7 +54,7 @@ def sparse_dense_matmul(
                 Int(iget(indptr, r)), Int(iget(indptr, r + 1))
             ):
                 acc += values.unsafe_load(k) * dense.unsafe_load(
-                    Int(iget(colind, k)) * d + c
+                    Int(iget(colind, k)) * dense_rows + c
                 )
             dst.unsafe_store(r * d + c, acc)
 
@@ -78,7 +82,8 @@ def coo_to_csr(
     cursor: IPtr,
     e: Int,
     n: Int,
-):
+    ncols: Int,
+) -> Int:
     """Counting sort of `[e, 2]` row-major COO into canonical row-major CSR.
 
     `tf.SparseTensor` does not require its `indices` to be sorted, and both
@@ -87,13 +92,22 @@ def coo_to_csr(
     is `n + 1` scratch. The placement pass walks the input in order, so
     duplicate `(row, col)` pairs keep their relative order exactly as a
     canonicalizing `tf.SparseTensor` would.
+
+    Returns 0 if an index is outside the dense shape, and 1 otherwise.
     """
     var i = 0
     while i <= n:
         iput(indptr, i, 0)
         i += 1
+    # A row index goes straight into `indptr[r + 1]`, and a column index is a
+    # node the sparse kernels gather, so both are range-checked here, in the
+    # counting pass: it is the only pass that must finish before any pointer
+    # is used.
     for k in range(e):
         var r = Int(rows.unsafe_load(k))
+        var c = Int(cols.unsafe_load(k))
+        if r < 0 or r >= n or c < 0 or c >= ncols:
+            return 0
         iput(indptr, r + 1, iget(indptr, r + 1) + 1)
     for c in range(1, n + 1):
         iput(indptr, c, iget(indptr, c) + iget(indptr, c - 1))
@@ -108,6 +122,7 @@ def coo_to_csr(
         iput(colind, at, Int(cols.unsafe_load(k)))
         result.unsafe_store(at, values.unsafe_load(k))
         iput(cursor, r, at + 1)
+    return 1
 
 
 def csr_row_sums(indptr: IPtr, colind: IPtr, values: FPtr, dst: FPtr, n: Int):

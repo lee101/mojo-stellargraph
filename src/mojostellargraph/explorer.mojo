@@ -105,8 +105,10 @@ def uniform_random_walk(
                 steps += 1
                 var lo = Int(iget(indptr, current_node))
                 var deg = Int(iget(indptr, current_node + 1)) - lo
-                if deg == 0:
-                    # for whatever reason this node has no neighbours so stop
+                if deg <= 0:
+                    # a node with no neighbours stops the walk, and so does a
+                    # non-monotonic `indptr` (the caller may pass its own CSR):
+                    # a negative degree is not a column range
                     break
                 var k = 0
                 while k < deg:
@@ -146,12 +148,16 @@ def naive_weighted_choices(
     ```
 
     `work` is the running-total scratch. A negative weight is upstream's one
-    error path; it is reported by returning `-1`.
+    error path; it is reported by returning `-1`. A node with no neighbours has
+    no interval to sample from, so it returns `-2` rather than reading
+    `colind[lo - 1]`, which is outside the buffer.
     """
-    var total = 0.0
-    var k = 0
     var lo = Int(iget(indptr, node))
     var deg = Int(iget(indptr, node + 1)) - lo
+    if deg <= 0:
+        return -2
+    var total = 0.0
+    var k = 0
     while k < deg:
         var w = weights.unsafe_load(k)
         if w < 0.0:
@@ -262,7 +268,7 @@ def biased_random_walk(
                     steps += 1
                     var clo = Int(iget(indptr, current_node))
                     var cdeg = Int(iget(indptr, current_node + 1)) - clo
-                    if cdeg == 0:
+                    if cdeg <= 0:
                         break
 
                     # transition_probability over the current node's neighbours

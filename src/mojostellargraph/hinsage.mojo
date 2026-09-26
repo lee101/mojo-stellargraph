@@ -6,7 +6,7 @@ once per relation (edge type) and the per-relation means are averaged. The
 synthetic zero vector — is kept.
 """
 
-from mojostellargraph.types import FPtr, activation, dot
+from mojostellargraph.types import FPtr, W, activation_inplace, dot
 
 
 def MeanHinAggregator_call(
@@ -57,11 +57,35 @@ def MeanHinAggregator_call(
         var base = r * b * h * s * d
         if s > 0:
             for i in range(b * h):
-                for j in range(d):
-                    var acc = 0.0
-                    for t in range(s):
-                        acc += x_neigh.unsafe_load(base + (i * s + t) * d + j)
-                    work.unsafe_store(i * d + j, acc / Float64(s))
+                var drow = work.unsafe_offset(i * d)
+                var nrow = x_neigh.unsafe_offset(base + i * s * d)
+                var j = 0
+                while j + W <= d:
+                    drow.unsafe_store(j, nrow.unsafe_load[width=W](j))
+                    j += W
+                while j < d:
+                    drow.unsafe_store(j, nrow.unsafe_load(j))
+                    j += 1
+                var t = 1
+                while t < s:
+                    nrow = nrow.unsafe_offset(d)
+                    j = 0
+                    while j + W <= d:
+                        drow.unsafe_store(
+                            j, drow.unsafe_load[width=W](j) + nrow.unsafe_load[width=W](j)
+                        )
+                        j += W
+                    while j < d:
+                        drow.unsafe_store(j, drow.unsafe_load(j) + nrow.unsafe_load(j))
+                        j += 1
+                    t += 1
+                j = 0
+                while j + W <= d:
+                    drow.unsafe_store(j, drow.unsafe_load[width=W](j) / Float64(s))
+                    j += W
+                while j < d:
+                    drow.unsafe_store(j, drow.unsafe_load(j) / Float64(s))
+                    j += 1
             dot(
                 work,
                 w_neigh + r * d * half_output_dim,
@@ -74,7 +98,7 @@ def MeanHinAggregator_call(
             # z_agg = tf.zeros((z_shape[0], z_shape[1], w_shape))
             var z = 0
             while z < b * h * half_output_dim:
-                scratch.unsafe_store(z, 0.0)
+                scratch.unsafe_store(r * b * h * half_output_dim + z, 0.0)
                 z += 1
 
     # from_self = K.dot(x[0], self.w_self)
@@ -83,34 +107,66 @@ def MeanHinAggregator_call(
     # from_neigh = sum(neigh_agg_by_relation) / self.nr
     var bh = b * h
     for i in range(bh):
-        for j in range(half_output_dim):
-            var acc = 0.0
-            for r in range(nr):
-                acc += scratch.unsafe_load(
-                    r * bh * half_output_dim + i * half_output_dim + j
+        var drow = work.unsafe_offset(bh * half_output_dim + i * half_output_dim)
+        var srow = scratch.unsafe_offset(i * half_output_dim)
+        var j = 0
+        while j + W <= half_output_dim:
+            drow.unsafe_store(j, srow.unsafe_load[width=W](j))
+            j += W
+        while j < half_output_dim:
+            drow.unsafe_store(j, srow.unsafe_load(j))
+            j += 1
+        var r = 1
+        while r < nr:
+            srow = srow.unsafe_offset(bh * half_output_dim)
+            j = 0
+            while j + W <= half_output_dim:
+                drow.unsafe_store(
+                    j, drow.unsafe_load[width=W](j) + srow.unsafe_load[width=W](j)
                 )
-            work.unsafe_store(
-                bh * half_output_dim + i * half_output_dim + j, acc / Float64(nr)
-            )
+                j += W
+            while j < half_output_dim:
+                drow.unsafe_store(j, drow.unsafe_load(j) + srow.unsafe_load(j))
+                j += 1
+            r += 1
+        j = 0
+        while j + W <= half_output_dim:
+            drow.unsafe_store(j, drow.unsafe_load[width=W](j) / Float64(nr))
+            j += W
+        while j < half_output_dim:
+            drow.unsafe_store(j, drow.unsafe_load(j) / Float64(nr))
+            j += 1
 
     # total = K.concatenate([from_self, from_neigh], axis=2)
     for i in range(bh):
-        for j in range(half_output_dim):
-            result.unsafe_store(
-                i * 2 * half_output_dim + j,
-                work.unsafe_load(i * half_output_dim + j),
-            )
-            result.unsafe_store(
-                i * 2 * half_output_dim + half_output_dim + j,
-                work.unsafe_load(bh * half_output_dim + i * half_output_dim + j),
-            )
+        var self_row = work.unsafe_offset(i * half_output_dim)
+        var neigh_row = work.unsafe_offset(bh * half_output_dim + i * half_output_dim)
+        var drow = result.unsafe_offset(i * 2 * half_output_dim)
+        var j = 0
+        while j + W <= half_output_dim:
+            drow.unsafe_store(j, self_row.unsafe_load[width=W](j))
+            drow.unsafe_store(j + half_output_dim, neigh_row.unsafe_load[width=W](j))
+            j += W
+        while j < half_output_dim:
+            drow.unsafe_store(j, self_row.unsafe_load(j))
+            drow.unsafe_store(j + half_output_dim, neigh_row.unsafe_load(j))
+            j += 1
 
     # return self.act((total + self.bias) if self.has_bias else total)
     if has_bias:
-        for i in range(b * h * 2 * half_output_dim):
-            result.unsafe_store(i, result.unsafe_load(i) + bias.unsafe_load(i % (2 * half_output_dim)))
-    activation(result, work, b * h, 2 * half_output_dim, act, alpha)
-    var o = 0
-    while o < b * h * 2 * half_output_dim:
-        result.unsafe_store(o, work.unsafe_load(o))
-        o += 1
+        for r in range(bh):
+            var drow = result.unsafe_offset(r * 2 * half_output_dim)
+            var j = 0
+            while j + 2 * W <= 2 * half_output_dim:
+                drow.unsafe_store(
+                    j, drow.unsafe_load[width=W](j) + bias.unsafe_load[width=W](j)
+                )
+                drow.unsafe_store(
+                    j + W,
+                    drow.unsafe_load[width=W](j + W) + bias.unsafe_load[width=W](j + W),
+                )
+                j += 2 * W
+            while j < 2 * half_output_dim:
+                drow.unsafe_store(j, drow.unsafe_load(j) + bias.unsafe_load(j))
+                j += 1
+    activation_inplace(result, b * h, 2 * half_output_dim, act, alpha)

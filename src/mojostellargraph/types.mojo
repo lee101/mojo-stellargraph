@@ -16,6 +16,7 @@ from std.sys import simd_width_of
 comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int32, AnyOrigin[mut=True]]
 comptime W = simd_width_of[DType.float64]()
+comptime Vec = SIMD[DType.float64, W]
 
 # Upstream holds activations as Keras objects (`activations.get("relu")`).
 # A C ABI call cannot take one, so the Python side maps the upstream string to
@@ -35,21 +36,226 @@ comptime ACT_SOFT_SIGN = 10
 
 
 def dot(a: FPtr, b: FPtr, dst: FPtr, n: Int, k: Int, m: Int):
-    """`dst[n, m] = a[n, k] @ b[k, m]`, row-major. Upstream: `K.dot`."""
-    for i in range(n):
-        for j in range(m):
-            var acc = 0.0
-            for t in range(k):
-                acc += a.unsafe_load(i * k + t) * b.unsafe_load(t * m + j)
-            dst.unsafe_store(i * m + j, acc)
+    """`dst[n, m] = a[n, k] @ b[k, m]`, row-major. Upstream: `K.dot`.
+
+    Two SIMD kernels, chosen on the size of `b`. Both multiply-accumulate
+    `W` output columns at a time; which is faster depends only on whether
+    `b` is still in cache by the time the next block of rows of `a` needs
+    it again.
+
+    `_dot_jvec` holds the output in registers and re-reads `b` once per two
+    rows of `a`, so it wins whenever `b` fits in the last-level cache, and
+    also on the short-`k` products the pooling aggregators run. `_dot_axpy`
+    re-reads `b` once per four rows of `a` and accumulates in `dst` in
+    memory, so it wins on the products where streaming `b` dominates. The
+    threshold is 1 MiB, measured; past it the two kernels cross over.
+    """
+    if k * m * 8 <= 1048576:
+        _dot_jvec(a, b, dst, n, k, m)
+    else:
+        _dot_axpy(a, b, dst, n, k, m)
+
+
+def _dot_jvec(a: FPtr, b: FPtr, dst: FPtr, n: Int, k: Int, m: Int):
+    """`dot` two rows of `a` at a time, `4 * W` output columns in registers.
+
+    Each `b` row is loaded once and used for both rows of `a`, which halves
+    the traffic in `b` against a one-row-at-a-time kernel and leaves four
+    independent accumulator chains per FMA port.
+    """
+    var i = 0
+    while i + 2 <= n:
+        var a0 = a.unsafe_offset(i * k)
+        var a1 = a0.unsafe_offset(k)
+        var d0 = dst.unsafe_offset(i * m)
+        var d1 = d0.unsafe_offset(m)
+        var j = 0
+        while j + 4 * W <= m:
+            var c00 = Vec(0.0)
+            var c01 = Vec(0.0)
+            var c02 = Vec(0.0)
+            var c03 = Vec(0.0)
+            var c10 = Vec(0.0)
+            var c11 = Vec(0.0)
+            var c12 = Vec(0.0)
+            var c13 = Vec(0.0)
+            var t = 0
+            while t < k:
+                var b0 = b.unsafe_load[width=W](t * m + j)
+                var b1 = b.unsafe_load[width=W](t * m + j + W)
+                var b2 = b.unsafe_load[width=W](t * m + j + 2 * W)
+                var b3 = b.unsafe_load[width=W](t * m + j + 3 * W)
+                c00 = c00 + b0 * a0.unsafe_load(t)
+                c01 = c01 + b1 * a0.unsafe_load(t)
+                c02 = c02 + b2 * a0.unsafe_load(t)
+                c03 = c03 + b3 * a0.unsafe_load(t)
+                c10 = c10 + b0 * a1.unsafe_load(t)
+                c11 = c11 + b1 * a1.unsafe_load(t)
+                c12 = c12 + b2 * a1.unsafe_load(t)
+                c13 = c13 + b3 * a1.unsafe_load(t)
+                t += 1
+            d0.unsafe_store(j, c00)
+            d0.unsafe_store(j + W, c01)
+            d0.unsafe_store(j + 2 * W, c02)
+            d0.unsafe_store(j + 3 * W, c03)
+            d1.unsafe_store(j, c10)
+            d1.unsafe_store(j + W, c11)
+            d1.unsafe_store(j + 2 * W, c12)
+            d1.unsafe_store(j + 3 * W, c13)
+            j += 4 * W
+        while j + W <= m:
+            var c0 = Vec(0.0)
+            var c1 = Vec(0.0)
+            var t = 0
+            while t < k:
+                var bv = b.unsafe_load[width=W](t * m + j)
+                c0 = c0 + bv * a0.unsafe_load(t)
+                c1 = c1 + bv * a1.unsafe_load(t)
+                t += 1
+            d0.unsafe_store(j, c0)
+            d1.unsafe_store(j, c1)
+            j += W
+        while j < m:
+            var s0 = 0.0
+            var s1 = 0.0
+            var t = 0
+            while t < k:
+                var bv = b.unsafe_load(t * m + j)
+                s0 += a0.unsafe_load(t) * bv
+                s1 += a1.unsafe_load(t) * bv
+                t += 1
+            d0.unsafe_store(j, s0)
+            d1.unsafe_store(j, s1)
+            j += 1
+        i += 2
+    if i < n:
+        _dot_row(a.unsafe_offset(i * k), b, dst.unsafe_offset(i * m), k, m)
+
+
+def _dot_row(arow: FPtr, b: FPtr, drow: FPtr, k: Int, m: Int):
+    """`_dot_jvec` for the odd row left over by its two-row blocking."""
+    var j = 0
+    while j + 4 * W <= m:
+        var c0 = Vec(0.0)
+        var c1 = Vec(0.0)
+        var c2 = Vec(0.0)
+        var c3 = Vec(0.0)
+        var t = 0
+        while t < k:
+            var av = arow.unsafe_load(t)
+            c0 = c0 + b.unsafe_load[width=W](t * m + j) * av
+            c1 = c1 + b.unsafe_load[width=W](t * m + j + W) * av
+            c2 = c2 + b.unsafe_load[width=W](t * m + j + 2 * W) * av
+            c3 = c3 + b.unsafe_load[width=W](t * m + j + 3 * W) * av
+            t += 1
+        drow.unsafe_store(j, c0)
+        drow.unsafe_store(j + W, c1)
+        drow.unsafe_store(j + 2 * W, c2)
+        drow.unsafe_store(j + 3 * W, c3)
+        j += 4 * W
+    while j + W <= m:
+        var c0 = Vec(0.0)
+        var t = 0
+        while t < k:
+            c0 = c0 + b.unsafe_load[width=W](t * m + j) * arow.unsafe_load(t)
+            t += 1
+        drow.unsafe_store(j, c0)
+        j += W
+    while j < m:
+        var acc = 0.0
+        var t = 0
+        while t < k:
+            acc += arow.unsafe_load(t) * b.unsafe_load(t * m + j)
+            t += 1
+        drow.unsafe_store(j, acc)
+        j += 1
+
+
+def _dot_axpy(a: FPtr, b: FPtr, dst: FPtr, n: Int, k: Int, m: Int):
+    """`dot` as four rank-1 updates at a time: one streaming pass over `b`
+    per block of four rows of `a`, accumulating in `dst`."""
+    var i = 0
+    while i + 4 <= n:
+        var a0 = a.unsafe_offset(i * k)
+        var a1 = a0.unsafe_offset(k)
+        var a2 = a1.unsafe_offset(k)
+        var a3 = a2.unsafe_offset(k)
+        var d0 = dst.unsafe_offset(i * m)
+        var d1 = d0.unsafe_offset(m)
+        var d2 = d1.unsafe_offset(m)
+        var d3 = d2.unsafe_offset(m)
+        var zero = Vec(0.0)
+        var j = 0
+        while j + W <= m:
+            d0.unsafe_store(j, zero)
+            d1.unsafe_store(j, zero)
+            d2.unsafe_store(j, zero)
+            d3.unsafe_store(j, zero)
+            j += W
+        while j < m:
+            d0.unsafe_store(j, 0.0)
+            d1.unsafe_store(j, 0.0)
+            d2.unsafe_store(j, 0.0)
+            d3.unsafe_store(j, 0.0)
+            j += 1
+        var t = 0
+        while t < k:
+            var x0 = a0.unsafe_load(t)
+            var x1 = a1.unsafe_load(t)
+            var x2 = a2.unsafe_load(t)
+            var x3 = a3.unsafe_load(t)
+            j = 0
+            while j + W <= m:
+                var bv = b.unsafe_load[width=W](t * m + j)
+                d0.unsafe_store(j, d0.unsafe_load[width=W](j) + bv * x0)
+                d1.unsafe_store(j, d1.unsafe_load[width=W](j) + bv * x1)
+                d2.unsafe_store(j, d2.unsafe_load[width=W](j) + bv * x2)
+                d3.unsafe_store(j, d3.unsafe_load[width=W](j) + bv * x3)
+                j += W
+            while j < m:
+                var bv = b.unsafe_load(t * m + j)
+                d0.unsafe_store(j, d0.unsafe_load(j) + bv * x0)
+                d1.unsafe_store(j, d1.unsafe_load(j) + bv * x1)
+                d2.unsafe_store(j, d2.unsafe_load(j) + bv * x2)
+                d3.unsafe_store(j, d3.unsafe_load(j) + bv * x3)
+                j += 1
+            t += 1
+        i += 4
+    while i < n:
+        var arow = a.unsafe_offset(i * k)
+        var drow = dst.unsafe_offset(i * m)
+        var zero = Vec(0.0)
+        var j = 0
+        while j + W <= m:
+            drow.unsafe_store(j, zero)
+            j += W
+        while j < m:
+            drow.unsafe_store(j, 0.0)
+            j += 1
+        var t = 0
+        while t < k:
+            var av = arow.unsafe_load(t)
+            j = 0
+            while j < m:
+                drow.unsafe_store(j, drow.unsafe_load(j) + av * b.unsafe_load(t * m + j))
+                j += 1
+            t += 1
+        i += 1
 
 
 def dot_vec(a: FPtr, x: FPtr, dst: FPtr, n: Int, k: Int):
     """`dst[n] = a[n, k] @ x[k]`. Upstream: `K.dot(A, v)` on a rank-1 tensor."""
     for i in range(n):
-        var acc = 0.0
-        for t in range(k):
-            acc += a.unsafe_load(i * k + t) * x.unsafe_load(t)
+        var arow = a.unsafe_offset(i * k)
+        var c = SIMD[DType.float64, W](0.0)
+        var t = 0
+        while t + W <= k:
+            c = c + arow.unsafe_load[width=W](t) * x.unsafe_load[width=W](t)
+            t += W
+        var acc = c.reduce_add()
+        while t < k:
+            acc += arow.unsafe_load(t) * x.unsafe_load(t)
+            t += 1
         dst.unsafe_store(i, acc)
 
 
@@ -92,17 +298,62 @@ def activate(x: Float64, act: Int, alpha: Float64) -> Float64:
     return x
 
 
-def activation(x: FPtr, dst: FPtr, n: Int, d: Int, act: Int, alpha: Float64):
-    """Elementwise over an `[n, d]` block. Upstream: `self.activation(output)`.
+def activate_vec(x: Vec, act: Int, alpha: Float64) -> Vec:
+    """`activate` on a vector of `W` elements.
 
-    `ACT_SOFTMAX` is row-wise, matching how Keras applies a softmax activation.
+    The stdlib's `exp`, `log` and `tanh` are defined for `SIMD` as well as
+    for `Float64`, but a Mojo function cannot be generic over the two, so
+    the chain is written out a second time rather than once per element.
     """
-    for i in range(n * d):
-        dst.unsafe_store(
-            i, activate(x.unsafe_load(i), act, alpha)
-        )
-    if act == ACT_SOFTMAX:
-        softmax_rows(dst, n, d)
+    if act == ACT_RELU:
+        return max(x, Vec(0.0))
+    if act == ACT_ELU:
+        return max(x, Vec(0.0)) + min(exp(x) - Vec(1.0), Vec(0.0))
+    if act == ACT_SIGMOID:
+        return Vec(1.0) / (Vec(1.0) + exp(-x))
+    if act == ACT_TANH:
+        return tanh(x)
+    if act == ACT_SOFTPLUS:
+        return log(Vec(1.0) + exp(x))
+    if act == ACT_LEAKY_RELU:
+        return max(x, Vec(0.0)) + min(Vec(alpha) * x, Vec(0.0))
+    if act == ACT_HARD_SIGMOID:
+        return max(Vec(0.0), min(Vec(1.0), Vec(0.2) * x + Vec(0.5)))
+    if act == ACT_SOFT_SIGN:
+        return x / (Vec(1.0) + abs(x))
+    if act == ACT_EXP:
+        return exp(x)
+    return x
+
+
+def softmax_row(x: FPtr, r: Int, d: Int, m: Float64):
+    """In-place softmax of one `[d]` row, given that row's maximum.
+
+    `exp` is evaluated once per element, not once per element per stage:
+    the shifted exponential overwrites the row, and the last pass divides
+    by the sum. A caller that has just written the row and computed its
+    maximum on the way past can skip the reduction and call this.
+    """
+    var s = 0.0
+    var j = 0
+    while j + W <= d:
+        var e = exp(x.unsafe_load[width=W](r * d + j) - m)
+        x.unsafe_store(r * d + j, e)
+        s += e.reduce_add()
+        j += W
+    while j < d:
+        var e = exp(x.unsafe_load(r * d + j) - m)
+        x.unsafe_store(r * d + j, e)
+        s += e
+        j += 1
+    var inv = 1.0 / s
+    j = 0
+    while j + W <= d:
+        x.unsafe_store(r * d + j, x.unsafe_load[width=W](r * d + j) * inv)
+        j += W
+    while j < d:
+        x.unsafe_store(r * d + j, x.unsafe_load(r * d + j) * inv)
+        j += 1
 
 
 def softmax_rows(x: FPtr, n: Int, d: Int):
@@ -113,13 +364,14 @@ def softmax_rows(x: FPtr, n: Int, d: Int):
     """
     for r in range(n):
         var m = -1.7976931348623157e308
-        for j in range(d):
+        var j = 0
+        while j + W <= d:
+            m = max(Vec(m), x.unsafe_load[width=W](r * d + j)).reduce_max()
+            j += W
+        while j < d:
             m = max(m, x.unsafe_load(r * d + j))
-        var s = 0.0
-        for j in range(d):
-            s += exp(x.unsafe_load(r * d + j) - m)
-        for j in range(d):
-            x.unsafe_store(r * d + j, exp(x.unsafe_load(r * d + j) - m) / s)
+            j += 1
+        softmax_row(x, r, d, m)
 
 
 def softmax_dim2(x: FPtr, dst: FPtr, b: Int, h: Int, k: Int):
@@ -147,13 +399,45 @@ def l2_normalize(x: FPtr, dst: FPtr, n: Int, d: Int):
     var eps = 1e-7
     for r in range(n):
         var s = 0.0
-        for j in range(d):
+        var j = 0
+        while j + W <= d:
+            var v = x.unsafe_load[width=W](r * d + j)
+            s += (v * v).reduce_add()
+            j += W
+        while j < d:
             var t = x.unsafe_load(r * d + j)
             s += t * t
+            j += 1
         s = sqrt(s)
         var scale = 1.0 / max(s, eps)
-        for j in range(d):
+        j = 0
+        while j + W <= d:
+            dst.unsafe_store(r * d + j, x.unsafe_load[width=W](r * d + j) * scale)
+            j += W
+        while j < d:
             dst.unsafe_store(r * d + j, x.unsafe_load(r * d + j) * scale)
+            j += 1
+
+
+def activation_inplace(x: FPtr, n: Int, d: Int, act: Int, alpha: Float64):
+    """Elementwise activation over an `[n, d]` block, in place.
+
+    Upstream: `self.activation(output)`. Every layer kernel here used to
+    write into a second scratch buffer and copy the result back over the
+    input; the copy was one extra pass over `n * d` doubles per call and
+    nothing else. Both the elementwise branch and `softmax_rows` are safe
+    on aliased input and output. `ACT_SOFTMAX` is row-wise, matching how
+    Keras applies a softmax activation.
+    """
+    var i = 0
+    while i + W <= n * d:
+        x.unsafe_store(i, activate_vec(x.unsafe_load[width=W](i), act, alpha))
+        i += W
+    while i < n * d:
+        x.unsafe_store(i, activate(x.unsafe_load(i), act, alpha))
+        i += 1
+    if act == ACT_SOFTMAX:
+        softmax_rows(x, n, d)
 
 
 def iput(p: IPtr, idx: Int, v: Int):

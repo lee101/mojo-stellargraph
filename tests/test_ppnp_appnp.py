@@ -169,14 +169,14 @@ def test_appnp_propagation_layer_final_layer_gathers(gcn_gen):
 
 
 def test_appnp_propagate_zero_steps_is_the_identity(gcn_gen):
-    model = sg.APPNP([5], gcn_gen)
+    model = sg.APPNP([5], ["relu"], gcn_gen)
     got = model.propagate(gcn_gen.features, gcn_gen.Aadj, 0)
     assert np.abs(got - gcn_gen.features).max() == 0.0
 
 
 def test_appnp_propagate_without_teleport_is_a_matrix_power(gcn_gen):
     # alpha = 0 kills the teleport term, so k steps of APPNP are exactly A^k X
-    model = sg.APPNP([5], gcn_gen, teleport_probability=0.0)
+    model = sg.APPNP([5], ["relu"], gcn_gen, teleport_probability=0.0)
     a = gcn_gen.Aadj
     power = np.eye(a.shape[0])
     for k in range(6):
@@ -189,7 +189,7 @@ def test_appnp_propagate_counts_steps(gcn_gen):
     # k propagations are k applications of the one-step map, checked against
     # the same map applied in Python
     alpha = 0.3
-    model = sg.APPNP([5], gcn_gen, teleport_probability=alpha)
+    model = sg.APPNP([5], ["relu"], gcn_gen, teleport_probability=alpha)
     a = gcn_gen.Aadj
     x = gcn_gen.features
     z = x.copy()
@@ -275,7 +275,7 @@ def test_appnp_converges_to_the_ppnp_matrix(gcn_gen, ppnp_gen):
     # matrix PPNP's generator precomputes and applies in one propagation. The
     # two models therefore agree in the limit, for the same base features.
     alpha = 0.1
-    model = sg.APPNP([5], gcn_gen, teleport_probability=alpha)
+    model = sg.APPNP([5], ["relu"], gcn_gen, teleport_probability=alpha)
     got = model.propagate(gcn_gen.features, gcn_gen.Aadj, 3000)
     assert np.abs(got - ppnp_gen.Aadj @ gcn_gen.features).max() <= TOL_INV
 
@@ -283,7 +283,7 @@ def test_appnp_converges_to_the_ppnp_matrix(gcn_gen, ppnp_gen):
 def test_appnp_limit_is_the_hand_built_ppr_matrix(gcn_gen):
     # the same limit, against alpha (I - (1 - alpha) S)^-1 written out here
     alpha = 0.1
-    model = sg.APPNP([5], gcn_gen, teleport_probability=alpha)
+    model = sg.APPNP([5], ["relu"], gcn_gen, teleport_probability=alpha)
     got = model.propagate(gcn_gen.features, gcn_gen.Aadj, 3000)
     want = alpha * np.linalg.inv(np.eye(14) - (1.0 - alpha) * gcn_gen.Aadj)
     assert np.abs(got - want @ gcn_gen.features).max() <= TOL_INV
@@ -291,7 +291,7 @@ def test_appnp_limit_is_the_hand_built_ppr_matrix(gcn_gen):
 
 def test_appnp_error_shrinks_with_k(gcn_gen):
     alpha = 0.1
-    model = sg.APPNP([5], gcn_gen, teleport_probability=alpha)
+    model = sg.APPNP([5], ["relu"], gcn_gen, teleport_probability=alpha)
     target = alpha * np.linalg.inv(np.eye(14) - (1.0 - alpha) * gcn_gen.Aadj)
     target = target @ gcn_gen.features
     err_20 = np.abs(model.propagate(gcn_gen.features, gcn_gen.Aadj, 20) - target).max()
@@ -306,7 +306,7 @@ def test_appnp_limit_fixes_the_sqrt_degree_vector(gcn_gen):
     # the limit matrix has the same eigenvector property as PPNP's, so this
     # checks the k -> infinity propagation against the generator's matrix
     # without forming the inverse
-    model = sg.APPNP([5], gcn_gen, teleport_probability=0.1)
+    model = sg.APPNP([5], ["relu"], gcn_gen, teleport_probability=0.1)
     adj, _ = _random_graph()
     root_degree = _sqrt_degree(adj)
     got = model.propagate(root_degree[:, None], gcn_gen.Aadj, 3000)
@@ -314,17 +314,61 @@ def test_appnp_limit_fixes_the_sqrt_degree_vector(gcn_gen):
 
 
 # --------------------------------------------------------------------- the models
+def _layers_of(model):
+    """The port's Dense stack as `(kernel, bias, act)` triples, which is the
+    shape the oracle's `_dense_stack` consumes."""
+    return [(l["kernel"], l["bias"], l["act"]) for l in model._layers]
+
+
 def test_appnp_model_is_dense_layers_then_propagation(gcn_gen):
-    model = sg.APPNP([5, 3], gcn_gen).build(7)
-    h = gcn_gen.features
-    for layer in model._layers:
-        h = h @ layer["kernel"]
-        if layer["bias"] is not None:
-            h = h + layer["bias"]
-    want = ref.appnp_propagate(h, gcn_gen.Aadj, 2, 0.1)
-    got = model(gcn_gen.features, gcn_gen.Aadj, k=2)
+    model = sg.APPNP([5, 3], ["relu", "tanh"], gcn_gen, approx_iter=2).build(7)
+    got = model(gcn_gen.features, gcn_gen.Aadj)
+    want = ref.appnp_model_call(
+        gcn_gen.features, gcn_gen.Aadj, _layers_of(model), 0.1, 2
+    )
     assert got.shape == (14, 3)
     assert np.abs(got - want).max() <= TOL
+
+
+def test_appnp_model_runs_approx_iter_propagation_layers(gcn_gen):
+    """Upstream's `__init__` appends `approx_iter` propagation layers and
+    defaults that to ten, so the default model is a ten-step power iteration
+    and not a single one."""
+    model = sg.APPNP([5], ["relu"], gcn_gen).build(7)
+    assert model.approx_iter == 10
+    got = model(gcn_gen.features, gcn_gen.Aadj)
+    want = ref.appnp_model_call(
+        gcn_gen.features, gcn_gen.Aadj, _layers_of(model), 0.1, 10
+    )
+    assert np.abs(got - want).max() <= TOL
+
+
+def test_appnp_model_gathers_out_indices_on_the_final_layer(gcn_gen):
+    """Upstream builds the last of its `approx_iter` propagation layers with
+    `final_layer=True`, so `__call__` returns one row per output index."""
+    model = sg.APPNP([5], ["relu"], gcn_gen, approx_iter=3).build(7)
+    out_indices = np.array([4, 0, 11], dtype=np.int32)
+    got = model(gcn_gen.features, gcn_gen.Aadj, out_indices)
+    want = ref.appnp_model_call(
+        gcn_gen.features, gcn_gen.Aadj, _layers_of(model), 0.1, 3, out_indices
+    )
+    assert got.shape == (3, 5)
+    assert np.abs(got - want).max() <= TOL
+
+
+def test_appnp_model_rejects_its_upstream_preconditions(gcn_gen):
+    with pytest.raises(ValueError):
+        sg.APPNP([5, 3], ["relu"], gcn_gen)
+    with pytest.raises(ValueError):
+        sg.APPNP([5], ["relu"], gcn_gen, approx_iter=0)
+    with pytest.raises(ValueError):
+        sg.APPNP([5], ["relu"], gcn_gen, approx_iter=1.5)
+    with pytest.raises(ValueError):
+        sg.APPNP([5], ["relu"], gcn_gen, teleport_probability=7.0)
+    with pytest.raises(ValueError):
+        sg.APPNP([5], ["relu"], gcn_gen, teleport_probability=-0.5)
+    with pytest.raises(TypeError):
+        sg.APPNP([5], ["relu"], object())
 
 
 def test_ppnp_model_rejects_mismatched_layer_and_activation_counts(ppnp_gen):

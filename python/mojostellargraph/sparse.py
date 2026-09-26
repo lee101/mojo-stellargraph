@@ -35,6 +35,7 @@ class SparseTensor:
         raw = i32(indices).reshape(-1, 2)
         self.dense_shape = tuple(int(x) for x in dense_shape)
         n = self.dense_shape[0]
+        ncols = self.dense_shape[1] if len(self.dense_shape) > 1 else n
         vals = f64(values).reshape(-1)
         e = raw.shape[0]
         order = np.lexsort((raw[:, 1], raw[:, 0])) if e else np.zeros(0, np.int64)
@@ -52,11 +53,17 @@ class SparseTensor:
         # the reordered values are a temporary: bind them to a local so the
         # buffer outlives the FFI call
         canonical = np.ascontiguousarray(vals[order])
-        lib().msg_coo_to_csr(
+        rc = lib().msg_coo_to_csr(
             addr(self.rows), addr(self.cols), addr(canonical),
             addr(self.indptr), addr(self.colind), addr(self.canonical_values),
-            addr(cursor), e, n,
+            addr(cursor), e, n, ncols,
         )
+        if rc == 0 and e:
+            raise IndexError(
+                "sparse index out of range for a matrix of shape {}".format(
+                    self.dense_shape
+                )
+            )
 
     @property
     def indices(self) -> np.ndarray:
@@ -89,12 +96,19 @@ class SparseTensor:
 
 
 def sparse_matmul_dense(a: SparseTensor, dense: np.ndarray) -> np.ndarray:
-    """`tf.sparse.matmul(a, dense)` for a dense `[n, d]` right-hand side."""
+    """`tf.sparse.matmul(a, dense)` for a dense `[a.shape[1], d]` right-hand side."""
     dense = f64(dense)
-    n, d = dense.shape
-    dst = np.zeros((n, d), dtype=np.float64)
+    rows, cols = a.dense_shape
+    if dense.shape[0] != cols:
+        raise ValueError(
+            "right-hand side has {} rows, the matrix has {} columns".format(
+                dense.shape[0], cols
+            )
+        )
+    d = dense.shape[1]
+    dst = np.zeros((rows, d), dtype=np.float64)
     lib().msg_sparse_dense_matmul(
         addr(a.indptr), addr(a.colind), addr(a.canonical_values),
-        addr(dense), addr(dst), n, d,
+        addr(dense), addr(dst), rows, d, dense.shape[0],
     )
     return dst

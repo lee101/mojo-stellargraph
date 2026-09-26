@@ -173,7 +173,13 @@ def GCN_Aadj_feats_op(
     work = np.zeros((n, n), dtype=np.float64)
     work2 = np.zeros((n, n), dtype=np.float64)
     scratch = np.zeros(n, dtype=np.float64)
-    cheb = np.zeros(((k + 1) * n, n), dtype=np.float64)
+    # only the Chebyshev method writes here, so the other methods do not need
+    # a `k`-sized allocation they would never fill
+    cheb = (
+        np.zeros(((k + 1) * n, n), dtype=np.float64)
+        if method == "chebyshev"
+        else np.zeros((1, 1), dtype=np.float64)
+    )
     ok = lib().msg_GCN_Aadj_feats_op(
         addr(A), addr(out), addr(work), addr(work2), addr(scratch), addr(cheb),
         n, k, code,

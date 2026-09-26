@@ -260,14 +260,23 @@ def test_attentional_uniform_logits_average_the_projections(r):
 
 
 def test_attentional_call_matches_oracle(r):
-    """The group loop, then `K.concatenate`, the bias and the activation."""
-    agg = sg.AttentionalAggregator(OUT, bias=True, act="relu")
-    w1 = agg._build_group_weights(D, 1, OUT)
-    w2 = agg._build_group_weights(D, 2, OUT)
+    """The group loop, then `K.concatenate`, the bias and the activation.
+
+    `calculate_group_sizes` splits `output_dim` across the groups, so the
+    concatenation is `output_dim` wide and the one bias lines up with it. The
+    split is exercised on an `output_dim` that divides evenly, because the one
+    `w_attn_s` / `w_attn_g` pair the layer holds is built at the last group's
+    width and every group reads it; upstream overwrites it per group the same
+    way, so unequal group widths are outside what either layer can express.
+    """
+    width = 6
+    agg = sg.AttentionalAggregator(width, bias=True, act="relu")
+    w1 = agg._build_group_weights(D, 1, width // 2)
+    w2 = agg._build_group_weights(D, 2, width // 2)
     # the two groups share the one attention kernel pair the layer holds
     w_attn_s, w_attn_g = agg.w_attn_s, agg.w_attn_g
     x_self, x_g = head(r), neigh(r)
-    agg.bias = r.normal(size=2 * OUT)
+    agg.bias = r.normal(size=width)
     got = agg.call(x_self, np.stack([x_g, x_g], axis=0))
     exp = ref.graphsage_aggregator_call(
         np.concatenate([
@@ -275,8 +284,20 @@ def test_attentional_call_matches_oracle(r):
                 x_self, x_g, w, w_attn_s, w_attn_g)
             for w in (w1, w2)], axis=2),
         agg.bias, "relu")
-    assert got.shape == (B, H, 2 * OUT)
+    assert got.shape == (B, H, width)
     assert np.abs(got - exp).max() < SOFTMAX_ATOL
+
+
+def test_attentional_call_rejects_a_bias_of_the_wrong_width(r):
+    """The kernel adds `self.bias` over the whole concatenated row, so a bias
+    of any other length would be an out-of-bounds read, not a wrong number."""
+    agg = sg.AttentionalAggregator(OUT, bias=True, act="relu")
+    x_self, x_g = head(r), neigh(r)
+    for idx in (1, 2):
+        agg._build_group_weights(D, idx, OUT // 2)
+    agg.bias = r.normal(size=OUT + 1)
+    with pytest.raises(ValueError):
+        agg.call(x_self, np.stack([x_g, x_g], axis=0))
 
 
 def test_attentional_rejects_wrong_rank(r):
@@ -308,8 +329,11 @@ def oracle_mean_model(layer_sizes, aggs, xin, normalize="l2"):
         h = out
     outs = []
     for x in h:
+        # `Reshape(K.int_shape(x)[2:])(x) if K.int_shape(x)[1] == 1 else x`, with
+        # the batch axis the Keras tensor keeps and the squeezed
+        # representation does not
         if x.shape[1] == 1:
-            x = x.reshape(x.shape[0], x.shape[2], x.shape[3])
+            x = x.reshape((x.shape[0],) + x.shape[2:])
         outs.append(ref.graphsage_normalization(x, normalize))
     return outs[0] if len(outs) == 1 else outs
 
@@ -335,6 +359,61 @@ def test_graphsage_two_layers_match_oracle(r):
     exp = oracle_mean_model([OUT, 5], m._aggs, xin, "l2")
     assert got.shape == (B, H, 5)
     assert np.abs(got - exp).max() < ATOL
+
+
+def test_graphsage_single_head_drops_the_neighbourhood_axis(r):
+    """Upstream's `Reshape(K.int_shape(x)[2:])(x) if K.int_shape(x)[1] == 1`:
+    `neighbourhood_sizes[0]` is 1 upstream, so one head is the canonical
+    layout and the head axis goes away with it."""
+    xin = [r.normal(size=(B, 1, D)), r.normal(size=(B, 1, 3, D))]
+    m = sg.GraphSAGE([OUT], aggregator=sg.MeanAggregator, bias=False,
+                     normalize="l2")
+    got = m(xin)
+    assert got.shape == (B, OUT)
+    np.testing.assert_allclose(
+        got, oracle_mean_model([OUT], m._aggs, xin, "l2"), rtol=0, atol=ATOL
+    )
+
+
+def test_graphsage_head_group_contracts_the_whole_neighbour_block(r):
+    """`K.dot(x[i], w)` takes a rank-2 left operand, so the head node group
+    contracts everything below `n_head` at once rather than one row of it."""
+    n_neigh, heads = 3, 2
+    xin = [r.normal(size=(B, heads, n_neigh, D)), r.normal(size=(B, heads, 3, D))]
+    m = sg.GraphSAGE([OUT], aggregator=sg.MeanAggregator, bias=False,
+                     normalize=None)
+    m.build([[(n_neigh * D, D)]])
+    agg = m._aggs[0][0][0]
+    got = agg.group_aggregate(xin[0], 0)
+    want = (xin[0].reshape(B * heads, n_neigh * D) @ agg.w_group[0]).reshape(
+        B, heads, agg.output_dim
+    )
+    assert np.abs(got - want).max() == 0.0
+
+
+def test_attentional_aggregator_accepts_more_neighbours_than_output_width(r):
+    """Upstream keeps `attn` as its own `[b, h, n_neighbour + 1, 1]` tensor; the
+    port stages it in the output buffer, which therefore has to be at least
+    that wide even when it is wider than the output."""
+    n_neigh, units = 12, 4
+    agg = sg.AttentionalAggregator(units, bias=True, act="relu")
+    agg._build_group_weights(D, 0, units)
+    agg._build_group_weights(D, 1, units)
+    x_self = r.normal(size=(B, H, 1, D))
+    x_neigh = r.normal(size=(B, H, n_neigh, D))
+    got = agg.call(x_self, x_neigh[None, ...])
+    assert got.shape == (B, H, units)
+    assert np.isfinite(got).all()
+    # a single group, so the whole `output_dim` is that group's, and the
+    # numbers are the oracle's rather than merely finite
+    w, w_attn_s, w_attn_g = agg.w_group[0], agg.w_attn_s, agg.w_attn_g
+    want = ref.graphsage_aggregator_call(
+        ref.attentional_aggregator_group_aggregate(
+            x_self[:, :, 0, :], x_neigh, w, w_attn_s, w_attn_g
+        ),
+        agg.bias, "relu",
+    )
+    np.testing.assert_allclose(got, want, rtol=0, atol=SOFTMAX_ATOL)
 
 
 def test_graphsage_l2_normalization_gives_unit_rows(r):

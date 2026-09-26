@@ -26,7 +26,9 @@ class GraphPreProcessingLayer:
         """The adjacency pre-processing GCN requires: symmetric, with self
         loops, and normalized."""
         adj = f64(adj)
-        n = self.num_of_nodes
+        # upstream's `call` takes every size from `adj.shape[0]`;
+        # `num_of_nodes` only fixes `output_dims`
+        n = adj.shape[0]
         dst = np.zeros((n, n), dtype=np.float64)
         work = np.zeros((n, n), dtype=np.float64)
         rowsum = np.zeros(n, dtype=np.float64)

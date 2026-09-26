@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._lib import addr, f64, i32, lib
+from ._lib import addr, f64, i32, lib, node_indices
 
 
 def csr_from_edges(edges, n: int) -> tuple[np.ndarray, np.ndarray]:
@@ -21,6 +21,10 @@ def csr_from_edges(edges, n: int) -> tuple[np.ndarray, np.ndarray]:
     upstream, where `node.successors()`/`predecessors()` are sorted."""
     e = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
     e = e[np.lexsort((e[:, 1], e[:, 0]))]
+    if e.size and (int(e.min()) < 0 or int(e.max()) >= n):
+        raise IndexError(
+            "edge endpoint out of range for a graph of {} nodes".format(n)
+        )
     counts = np.bincount(e[:, 0], minlength=n) if e.size else np.zeros(n, np.int64)
     indptr = np.zeros(n + 1, dtype=np.int32)
     indptr[1:] = np.cumsum(counts)
@@ -43,13 +47,66 @@ class GraphWalk:
 
     def __init__(self, graph, n: int):
         self.n = int(n)
-        self.indptr, self.colind = _as_csr(graph, self.n)
+        indptr, colind = _as_csr(graph, self.n)
+        # the kernels read both as int32, and `np.cumsum` hands back int64
+        self.indptr, self.colind = i32(indptr), i32(colind)
+        if int(self.indptr[-1]) > int(self.colind.size):
+            raise ValueError("indptr counts more entries than colind holds")
         self.degrees = np.diff(self.indptr.astype(np.int64))
 
-    def _roots(self, nodes):
+    @staticmethod
+    def _raise_error(message):
+        raise ValueError(message)
+
+    def _check_nodes(self, nodes):
         if nodes is None:
-            return np.arange(self.n, dtype=np.int32)
-        return i32(np.asarray(nodes).reshape(-1))
+            self._raise_error("A list of root node IDs was not provided.")
+        if not isinstance(nodes, (list, tuple, np.ndarray)):
+            self._raise_error("Nodes parameter should be an iterable of node IDs.")
+        if len(nodes) == 0:
+            print(
+                "({}) WARNING: No root node IDs given. An empty list will be "
+                "returned as a result.".format(type(self).__name__)
+            )
+
+    def _check_repetitions(self, n):
+        if type(n) != int:
+            self._raise_error(
+                "The number of walks per root node, n, should be integer type."
+            )
+        if n <= 0:
+            self._raise_error(
+                "The number of walks per root node, n, should be a positive integer."
+            )
+
+    def _check_length(self, length):
+        if type(length) != int:
+            self._raise_error("The walk length, length, should be integer type.")
+        if length <= 0:
+            # Technically, length 0 should be okay, but by consensus is invalid.
+            self._raise_error("The walk length, length, should be a positive integer.")
+
+    def _check_seed(self, seed):
+        if seed is not None:
+            if type(seed) != int:
+                self._raise_error(
+                    "The random number generator seed value, seed, should be "
+                    "integer type or None."
+                )
+            if seed < 0:
+                self._raise_error(
+                    "The random number generator seed value, seed, should be "
+                    "non-negative integer or None."
+                )
+
+    def _check_common_parameters(self, nodes, n, length, seed):
+        self._check_nodes(nodes)
+        self._check_repetitions(n)
+        self._check_length(length)
+        self._check_seed(seed)
+
+    def _roots(self, nodes):
+        return node_indices(nodes, self.n)
 
     def run(self, nodes=None, n: int | None = None, length: int | None = None,
             seed=None):
@@ -76,6 +133,7 @@ class UniformRandomWalk(GraphWalk):
         Returns:
             A list of lists of node ids, one list per walk.
         """
+        self._check_common_parameters(nodes, n, length, seed)
         roots = self._roots(nodes)
         n = int(n)
         length = int(length)
@@ -117,8 +175,8 @@ class BiasedRandomWalk(GraphWalk):
             raise ValueError("Parameter p should be greater than 0.")
         if q <= 0.0:
             raise ValueError("Parameter q should be greater than 0.")
+        self._check_common_parameters(nodes, n, length, seed)
         roots = self._roots(nodes)
-        n = int(n)
         length = int(length)
         walks_out = np.zeros((roots.size * n, length), dtype=np.int32)
         lens_out = np.zeros(roots.size * n, dtype=np.int32)
@@ -157,13 +215,26 @@ def naive_weighted_choices(graph, weights, node: int, seed: int = 0) -> int:
     `numpy.random.RandomState`; that is the one documented divergence.
     """
     indptr, colind = _as_csr_graph(graph)
+    indptr, colind = i32(indptr), i32(colind)
     deg = int(indptr[node + 1]) - int(indptr[node])
     work = np.zeros(max(deg, 1), dtype=np.float64)
     weights = f64(np.asarray(weights, dtype=np.float64).reshape(-1))
+    # the kernel reads one weight per neighbour, so a shorter array is an
+    # out-of-bounds read rather than a wrong draw
+    if deg > 0 and weights.size < deg:
+        raise ValueError(
+            "node {} has {} neighbours but only {} weights".format(
+                node, deg, weights.size
+            )
+        )
     choice = lib().msg_naive_weighted_choices(
         addr(indptr), addr(colind), addr(weights), addr(work), int(node),
         (int(seed) + _INCR) & _MASK,
     )
+    if choice == -2:
+        raise ValueError(
+            "node {} has no neighbours to choose from".format(node)
+        )
     if choice < 0:
         raise ValueError("Detected negative weight in the transition weights")
     return int(choice)

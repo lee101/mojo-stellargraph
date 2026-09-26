@@ -212,6 +212,25 @@ def test_convolution_gather_repeats_a_row_for_a_repeated_index(
     np.testing.assert_array_equal(got, full[repeated])
 
 
+@pytest.mark.parametrize("m", [1, 25, 60])
+def test_convolution_gather_length_is_unconstrained_by_the_node_count(
+    adj_with_loops, features, m
+):
+    """`K.gather` has no bound on the output length, and upstream's
+    `out_indices_t` is `Input(batch_shape=(1, None))`, so `m` may exceed `n`:
+    a generator may repeat or overshoot the node set. Every output index must
+    still produce exactly one row, taken from the full output."""
+    n = features.shape[0]
+    indices = (np.arange(m, dtype=np.int64) * 7) % n
+    layer = _conv(5, activation="relu", final_layer=True, seed=22)
+    got = layer(features, adj_with_loops, indices.astype(np.int32))
+    full = ref.graph_convolution_call(
+        features, adj_with_loops, layer.kernel, layer.bias, "relu"
+    )
+    assert got.shape == (m, 5)
+    np.testing.assert_array_equal(got, full[indices])
+
+
 def test_convolution_ignores_indices_when_not_the_final_layer(
     adj_with_loops, features
 ):
@@ -397,3 +416,25 @@ def test_gcn_reports_the_generator_input_shape(adj_with_loops, features):
     assert model.node_model() == (((24, 7),), None)
     assert model.generator is gen
     assert model.method == "gcn"
+
+
+def test_softsign_activation_matches_its_closed_form():
+    """`softsign(x) = x / (1 + |x|)`. It is the one activation the parity
+    sweep over the documented names does not reach, because upstream's
+    `keras.activations.get` list is the source of truth and it is listed
+    there."""
+    r = np.random.default_rng(31)
+    x = r.normal(size=(6, 5)) * 4.0
+    expected = x / (1.0 + np.abs(x))
+    conv = sg.GraphConvolution(5, activation="softsign", use_bias=False)
+    conv.build(5)
+    conv.kernel[:] = np.eye(5)
+    np.testing.assert_allclose(conv(x, np.eye(6)), expected, atol=ATOL, rtol=0.0)
+    # the asymmetric half of the closed form, which the table above cannot see
+    wide = np.array([[-1e6, 1e6]], dtype=np.float64)
+    conv2 = sg.GraphConvolution(2, activation="softsign", use_bias=False)
+    conv2.build(2)
+    conv2.kernel[:] = np.eye(2)
+    np.testing.assert_allclose(
+        conv2(wide, np.eye(1)), wide / (1.0 + np.abs(wide)), atol=1e-12, rtol=0.0
+    )

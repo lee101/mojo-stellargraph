@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import activations as _acts
-from ._lib import addr, f64, i32, lib
+from ._lib import addr, f64, lib, node_indices
 from .sparse import SparseTensor
 
 HEADS_REDUCTION = {"concat": 0, "average": 1}
@@ -96,20 +96,28 @@ class GraphAttention:
         X = f64(X)
         A = f64(A)
         n, f = X.shape
+        if A.shape != (n, n):
+            raise ValueError(
+                "adjacency must be ({}, {}), got {}".format(n, n, A.shape)
+            )
         if self.kernels is None:
             self.build(f)
         # `out_indices=None` means no gather at all, so a final layer keeps
         # every node rather than gathering node 0
         if out_indices is None:
             out_indices = np.zeros(0, dtype=np.int32)
-        out_indices = i32(np.asarray(out_indices).reshape(-1))
+        out_indices = node_indices(out_indices, n)
         m = int(out_indices.shape[0])
 
-        result = np.zeros((n, self.output_dim), dtype=np.float64)
+        # `K.gather` returns one row per output index and `m` is unconstrained,
+        # so the staged gather needs `m` rows, not `n`.
+        result = np.zeros((max(n, m), self.output_dim), dtype=np.float64)
         # work holds the projected features, the dense [n, n] attention block
-        # and two [n] scratch vectors; it is reused for the output activation.
+        # and two [n] scratch vectors; it is reused for the output activation
+        # and then for the gathered rows.
         work = np.zeros(
-            max(n * self.units + 2 * n * n + n, n * self.output_dim), dtype=np.float64
+            max(n * self.units + 2 * n * n + n, max(n, m) * self.output_dim),
+            dtype=np.float64,
         )
         work2 = np.zeros(self.attn_heads * n * self.units, dtype=np.float64)
         bias = (
@@ -147,6 +155,10 @@ class GraphAttentionSparse(GraphAttention):
             A = SparseTensor.from_dense(A)
         X = f64(X)
         n, f = X.shape
+        if tuple(A.dense_shape) != (n, n):
+            raise ValueError(
+                "adjacency must be ({}, {}), got {}".format(n, n, A.dense_shape)
+            )
         if self.kernels is None:
             self.build(f)
         e = len(A)
@@ -154,14 +166,15 @@ class GraphAttentionSparse(GraphAttention):
         # every node rather than gathering node 0
         if out_indices is None:
             out_indices = np.zeros(0, dtype=np.int32)
-        out_indices = i32(np.asarray(out_indices).reshape(-1))
+        out_indices = node_indices(out_indices, n)
         m = int(out_indices.shape[0])
 
-        result = np.zeros((n, self.output_dim), dtype=np.float64)
+        # as in the dense path, the staged gather needs `m` rows
+        result = np.zeros((max(n, m), self.output_dim), dtype=np.float64)
         # the kernel's scratch is [n*units features | n attn_self |
         # n attn_neighs | e attn_values | e attn_norm], then the gathered rows
         work = np.zeros(
-            max(n * self.units + 2 * n + 2 * e, n * self.output_dim),
+            max(n * self.units + 2 * n + 2 * e, max(n, m) * self.output_dim),
             dtype=np.float64,
         )
         work2 = np.zeros(self.attn_heads * n * self.units, dtype=np.float64)

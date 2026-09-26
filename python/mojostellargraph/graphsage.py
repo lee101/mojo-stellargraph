@@ -219,17 +219,26 @@ class AttentionalAggregator(_Aggregator):
         self.w_attn_g = rng.uniform(-lim, lim, size=(out_size, 1))
         return w
 
-    def group_aggregate(self, x_self, x_g, group_idx) -> np.ndarray:
-        """One pass of upstream's group loop in `AttentionalAggregator.call`."""
+    def group_aggregate(self, x_self, x_g, group_idx, out_size=None) -> np.ndarray:
+        """One pass of upstream's group loop in `AttentionalAggregator.call`.
+
+        `out_size` is this group's share of `output_dim`; it is
+        `self.output_dim` for a single-group call, and `output_dim //
+        n_groups` for the multi-group `call` below, which is upstream's
+        `calculate_group_sizes` split."""
+        out_size = self.output_dim if out_size is None else int(out_size)
         x_self = f64(x_self)
         x_g = f64(x_g)
         b, h, _, d_self = _shape4(_as4(x_self), "x_self")
         _, _, s, d = _shape4(x_g, "x_g")
-        out = np.zeros((b * h, self.output_dim), dtype=np.float64)
+        # `out` holds the softmax `attn` tensor first and `h_out` second, so it
+        # must cover whichever of the two is wider: `attn` is
+        # `[b, h, n_neighbour + 1, 1]`, which is upstream's own tensor
+        out = np.zeros(max(b * h * out_size, b * h * (s + 1)), dtype=np.float64)
         attn = np.zeros(max(b * h * (s + 1), 1), dtype=np.float64)
         # work2 is [self | neighbours | xw_all], see the kernel's docstring
         pooled = np.zeros(
-            max(b * h * self.output_dim * (2 * s + 2), 1), dtype=np.float64
+            max(b * h * out_size * (2 * s + 2), 1), dtype=np.float64
         )
         w_g, w_s, w_attn_g = (
             f64(self.w_group[group_idx]), f64(self.w_attn_s), f64(self.w_attn_g)
@@ -238,9 +247,11 @@ class AttentionalAggregator(_Aggregator):
             addr(x_self.reshape(-1)), addr(x_g.reshape(-1)),
             addr(w_g), addr(w_s), addr(w_attn_g),
             addr(out), addr(attn), addr(pooled),
-            b, h, s, d_self, d, self.output_dim,
+            b, h, s, d_self, d, out_size,
         )
-        return out.reshape(b, h, self.output_dim)
+        # `out` doubles as the `attn` staging buffer, so it can be longer than
+        # the group output
+        return out[: b * h * out_size].reshape(b, h, out_size)
 
     def call(self, x_self, x_groups) -> np.ndarray:
         """`AttentionalAggregator.call` over every group.
@@ -254,16 +265,41 @@ class AttentionalAggregator(_Aggregator):
             x_self = x_self[:, :, None, :]
         b, h, _, d_self = x_self.shape
         n_groups, _, _, s, d = x_groups.shape
-        sources = np.zeros((b, h, n_groups * self.output_dim), dtype=np.float64)
-        for r in range(n_groups):
-            part = self.group_aggregate(x_self, x_groups[r], r + 1)
-            sources[:, :, r * self.output_dim : (r + 1) * self.output_dim] = part
+        # `if not group_sources: group_sources = [K.dot(x_self, w_group[0])]`,
+        # upstream's num_groups == 0 branch, which gives the head group the
+        # whole output width when there are no neighbour groups
+        if n_groups == 0:
+            # `w_group[0]` is only built when there is a head group to run
+            if 0 not in self.w_group:
+                self._build_group_weights(d_self, 0, self.output_dim)
+            wd = self.output_dim
+            sources = self.group_aggregate(x_self, _as4(x_self), 0, wd)
+            n_groups = 1
+        else:
+            # upstream's `calculate_group_sizes` splits `output_dim` across the
+            # groups, giving the remainder to the first, so the concatenation
+            # is `output_dim` wide and the one bias lines up with it
+            share = self.output_dim // n_groups
+            rem = self.output_dim - share * n_groups
+            sources = np.zeros((b, h, self.output_dim), dtype=np.float64)
+            at = 0
+            for r in range(n_groups):
+                w = share + (rem if r == 0 else 0)
+                sources[:, :, at : at + w] = self.group_aggregate(
+                    x_self, x_groups[r], r + 1, w
+                )
+                at += w
         out = np.zeros_like(sources)
-        work = np.zeros(max(b * h * sources.shape[2], 1), dtype=np.float64)
         bias_arr = f64(self.bias).reshape(-1)
+        if self.has_bias and bias_arr.size != sources.shape[2]:
+            raise ValueError(
+                "bias has {} elements, the concatenated groups have {}".format(
+                    bias_arr.size, sources.shape[2]
+                )
+            )
         lib().msg_AttentionalAggregator_call(
             addr(sources.reshape(-1)), addr(bias_arr),
-            addr(out), addr(work), b, h, n_groups, self.output_dim,
+            addr(out), b, h, sources.shape[2],
             1 if self.has_bias else 0, _acts.code(self.act), _acts.alpha(self.act),
         )
         return out
@@ -275,11 +311,16 @@ def _aggregator_call(sources, bias, has_bias, act) -> np.ndarray:
     sources = f64(sources)
     b, h, d = sources.shape
     out = np.zeros((b, h, d), dtype=np.float64)
-    work = np.zeros(max(b * h * d, 1), dtype=np.float64)
     bias_arr = f64(bias).reshape(-1)
+    if has_bias and bias_arr.size != d:
+        raise ValueError(
+            "bias has {} elements, the concatenated groups have {}".format(
+                bias_arr.size, d
+            )
+        )
     lib().msg_GraphSAGEAggregator_call(
         addr(sources.reshape(-1)), addr(bias_arr), addr(out),
-        addr(work), b, h, 1, d, 1 if has_bias else 0, _acts.code(act), _acts.alpha(act),
+        b, h, d, 1 if has_bias else 0, _acts.code(act), _acts.alpha(act),
     )
     return out
 
@@ -315,6 +356,10 @@ class GraphSAGE:
         self.normalize = normalize
         if activations is None:
             acts = ["relu"] * (self.max_hops - 1) + ["linear"]
+        elif len(activations) != self.max_hops:
+            raise ValueError(
+                "Invalid number of activations; require one function per layer"
+            )
         else:
             acts = list(activations)
         for a in acts:
@@ -414,8 +459,11 @@ class GraphSAGE:
 
         outs = []
         for x in h_layer:
+            # `Reshape(K.int_shape(x)[2:])(x) if K.int_shape(x)[1] == 1 else x`,
+            # with the batch axis the Keras tensor keeps and the squeezed
+            # representation does not
             if x.shape[1] == 1:
-                x = x.reshape(x.shape[0], x.shape[2], x.shape[3])
+                x = x.reshape((x.shape[0],) + x.shape[2:])
             outs.append(self._normalization(x))
         return outs[0] if len(outs) == 1 else outs
 
@@ -431,6 +479,8 @@ class GraphSAGE:
         b, h = x_self.shape[0], x_self.shape[1]
         if isinstance(aggs[0], AttentionalAggregator):
             return aggs[0].call(x_self, neigh_in[None, ...])
+        # the head group is contracted over everything below `n_head` at once;
+        # `_build_layer` sized `w` with that same product
         parts = [aggs[0].group_aggregate(x_self, 0)]
         parts += [
             agg.group_aggregate(neigh_in, g) for g, agg in enumerate(aggs[1:], 1)

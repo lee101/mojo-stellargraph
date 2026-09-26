@@ -573,3 +573,68 @@ def test_preprocessing_layer_row_sums_closed_form(adj_with_loops):
 def test_preprocessing_layer_call_and_dunder_agree(adj_with_loops):
     layer = sg.GraphPreProcessingLayer(adj_with_loops.shape[0])
     np.testing.assert_array_equal(layer(adj_with_loops), layer.call(adj_with_loops))
+
+
+# ------------------------------------------------- degenerate-input guards
+
+
+def test_normalize_adj_leaves_an_isolated_node_at_zero():
+    """`np.float_power(0, -0.5)` is `inf`, and `inf * 0` is NaN. SciPy's
+    `diags(...) .dot(adj)` only visits stored entries, so an isolated node
+    leaves a zero row and a zero column, not a NaN one."""
+    adj = np.array(
+        [[0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    got = sg.normalize_adj(adj, symmetric=True)
+    assert np.isfinite(got).all()
+    assert not np.isnan(got).any()
+    np.testing.assert_allclose(got[3], 0.0, atol=0.0)
+    np.testing.assert_allclose(got[:, 3], 0.0, atol=0.0)
+    # the rest of the matrix is unchanged by the isolated node
+    np.testing.assert_allclose(
+        got[:3, :3], sg.normalize_adj(adj[:3, :3], symmetric=True), atol=ATOL
+    )
+
+
+def test_normalize_adj_left_only_leaves_an_isolated_node_at_zero():
+    adj = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    got = sg.normalize_adj(adj, symmetric=False)
+    assert np.isfinite(got).all()
+
+
+def test_chebyshev_T0_is_the_identity_whatever_the_buffer_held():
+    """`T_0` is `sp.eye(n)`, so every off-diagonal entry is written, not just
+    the diagonal: `result` belongs to the caller."""
+    from mojostellargraph._lib import addr, f64, lib
+
+    n, k = 4, 3
+    x = np.random.default_rng(1).normal(size=(n, n))
+    x = np.ascontiguousarray((x + x.T) / 2.0)
+    # the polynomials land consecutively: `k + 1` blocks of `n * n`
+    xf = f64(x)
+    rf = np.full((k + 1) * n * n, -7.0)
+    wf = np.zeros(n * n)
+    lib().msg_chebyshev_polynomial(addr(xf), addr(rf), addr(wf), n, k)
+    t0 = rf[: n * n].reshape(n, n)
+    np.testing.assert_array_equal(t0, np.eye(n))
+
+
+def test_rescale_laplacian_survives_a_failed_eigensolve():
+    """Upstream substitutes `largest_eigval = 2` when ARPACK does not
+    converge, which is a scale of 1.0. `power_iteration` reports failure as
+    0.0, and `2.0 / 0.0` would be an all-infinite matrix."""
+    lap = np.array([[1.0, -1.0], [-1.0, 1.0]])
+    got = sg.rescale_laplacian(lap, largest_eigval=0.0)
+    assert np.isfinite(got).all()
+    np.testing.assert_allclose(got, sg.rescale_laplacian(lap, largest_eigval=2.0))
+
+
+def test_gcn_aadj_feats_op_chebyshev_is_finite_on_a_two_node_graph():
+    """A two-node graph's normalized Laplacian is regular, which is the case
+    a constant power-iteration start vector stalls on."""
+    adj = np.array([[0.0, 1.0], [1.0, 0.0]])
+    feats = np.arange(4.0).reshape(2, 2)
+    out, _ = sg.GCN_Aadj_feats_op(feats, adj, method="chebyshev", k=2)
+    assert all(np.isfinite(t).all() for t in out)

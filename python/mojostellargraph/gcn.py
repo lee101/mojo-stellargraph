@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import activations as _acts
-from ._lib import addr, f64, i32, lib
+from ._lib import addr, f64, lib, node_indices
 
 
 class GraphConvolution:
@@ -52,6 +52,10 @@ class GraphConvolution:
         features = f64(features)
         A = f64(A)
         n, f = features.shape
+        if A.shape != (n, n):
+            raise ValueError(
+                "adjacency must be ({}, {}), got {}".format(n, n, A.shape)
+            )
         if self.kernel is None:
             self.build(f)
         if self.kernel.shape[0] != f:
@@ -64,12 +68,14 @@ class GraphConvolution:
         # every node rather than gathering node 0
         if out_indices is None:
             out_indices = np.zeros(0, dtype=np.int32)
-        out_indices = i32(np.asarray(out_indices).reshape(-1))
+        out_indices = node_indices(out_indices, n)
         m = int(out_indices.shape[0])
 
-        result = np.zeros((n, self.units), dtype=np.float64)
+        # `K.gather` returns one row per output index and `m` is unconstrained,
+        # so the staged gather needs `m` rows, not `n`.
+        result = np.zeros((max(n, m), self.units), dtype=np.float64)
         # holds both `A @ features` (n x f) and the gathered rows
-        work = np.zeros((n, max(n, f, self.units, 1)), dtype=np.float64)
+        work = np.zeros((max(n, m), max(n, f, self.units, 1)), dtype=np.float64)
         bias = self.bias if self.use_bias else np.zeros(max(self.units, 1))
         lib().msg_GraphConvolution_call(
             addr(features), addr(A), addr(self.kernel), addr(bias), addr(result),

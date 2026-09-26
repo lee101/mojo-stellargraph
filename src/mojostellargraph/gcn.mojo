@@ -7,7 +7,13 @@ order. `GraphConvolution_call` keeps the upstream statement order verbatim;
 same list.
 """
 
-from mojostellargraph.types import FPtr, IPtr, activation, dot, iget
+from mojostellargraph.types import (
+    FPtr,
+    IPtr,
+    activation_inplace,
+    dot,
+    iget,
+)
 
 
 def GraphConvolution_call(
@@ -61,11 +67,7 @@ def GraphConvolution_call(
                 )
 
     # output = self.activation(output)
-    activation(result, work, n, units, act, alpha)
-    var o = 0
-    while o < n * units:
-        result.unsafe_store(o, work.unsafe_load(o))
-        o += 1
+    activation_inplace(result, n, units, act, alpha)
 
     # if self.final_layer: output = K.gather(output, out_indices)
     # The gather is staged in `work` first: `out_indices` need not be sorted,

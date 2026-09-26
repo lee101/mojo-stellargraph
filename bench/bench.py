@@ -230,12 +230,12 @@ def sampled(n, heads, samples, d, seed=5):
     )
 
 
-@case("MeanAggregator 2 hops (20000 x 10 heads x 25 x 64 -> 128)")
+@case("MeanAggregator 2 hops (6000 x 8 heads x 15 x 32 -> 64)")
 def _():
-    (x1, x2), head = sampled(20000, 10, [25, 25], 64)
-    agg = sg.MeanAggregator(128, bias=True, act="relu")
-    agg._build_group_weights(64, 0, 128)
-    agg._build_group_weights(64, 1, 128)
+    (x1, x2), head = sampled(6000, 8, [15, 15], 32)
+    agg = sg.MeanAggregator(64, bias=True, act="relu")
+    agg._build_group_weights(32, 0, 64)
+    agg._build_group_weights(32, 1, 64)
 
     def ours():
         agg.group_aggregate(head, 0)
@@ -250,12 +250,12 @@ def _():
     return ours, theirs
 
 
-@case("MaxPoolingAggregator 2 hops (20000 x 10 heads x 25 x 64 -> 128)")
+@case("MaxPoolingAggregator 2 hops (6000 x 8 heads x 15 x 32 -> 64)")
 def _():
-    (x1, x2), head = sampled(20000, 10, [25, 25], 64)
-    agg = sg.MaxPoolingAggregator(128, bias=True, act="relu")
+    (x1, x2), head = sampled(6000, 8, [15, 15], 32)
+    agg = sg.MaxPoolingAggregator(64, bias=True, act="relu")
     for g in (0, 1):
-        agg._build_group_weights(64, g, 128)
+        agg._build_group_weights(32, g, 64)
 
     def ours():
         agg.group_aggregate(x1, 1)
@@ -272,11 +272,11 @@ def _():
     return ours, theirs
 
 
-@case("AttentionalAggregator (20000 x 10 heads x 25 x 64 -> 128)")
+@case("AttentionalAggregator (6000 x 8 heads x 15 x 32 -> 64)")
 def _():
-    (x1,), head = sampled(20000, 10, [25], 64)
-    agg = sg.AttentionalAggregator(128, bias=True, act="relu")
-    agg._build_group_weights(64, 1, 128)
+    (x1,), head = sampled(6000, 8, [15], 32)
+    agg = sg.AttentionalAggregator(64, bias=True, act="relu")
+    agg._build_group_weights(32, 1, 64)
     return (
         lambda: agg.group_aggregate(head, x1, 1),
         lambda: ref.attentional_aggregator_group_aggregate(
@@ -315,23 +315,23 @@ def _graphsage_model(model, xin):
     return ref.graphsage_normalization(out, model.normalize)
 
 
-@case("GraphSAGE 3 layers, mean (20000 x 10 heads, 64 -> 128 -> 64 -> 32)")
+@case("GraphSAGE 3 layers, mean (6000 x 8 heads, 32 -> 64 -> 32 -> 16)")
 def _():
-    (x1, x2, x3), head = sampled(20000, 10, [25, 25, 25], 64)
-    model = sg.GraphSAGE([128, 64, 32], aggregator=sg.MeanAggregator, normalize="l2")
+    (x1, x2, x3), head = sampled(6000, 8, [15, 15, 15], 32)
+    model = sg.GraphSAGE([64, 32, 16], aggregator=sg.MeanAggregator, normalize="l2")
     xin = [head, x1, x2, x3]
     model(xin)  # builds the weights from the input widths
     return (lambda: model(xin), lambda: _graphsage_model(model, xin))
 
 
 # ------------------------------------- stellargraph/layer/hinsage.py
-@case("MeanHinAggregator 3 relations (20000 x 10 heads x 25 x 64 -> 128)")
+@case("MeanHinAggregator 3 relations (6000 x 8 heads x 15 x 32 -> 64)")
 def _():
     rng = np.random.default_rng(6)
-    b, hn, s, d, nr = 20000, 10, 25, 64, 3
+    b, hn, s, d, nr = 6000, 8, 15, 32, 3
     head = rng.normal(size=(b, hn, d))
     rel = rng.normal(size=(nr, b, hn, s, d))
-    agg = sg.MeanHinAggregator(128, nr, "relu", True).build(d, d)
+    agg = sg.MeanHinAggregator(64, nr, "relu", True).build(d, d)
     return (
         lambda: agg(head, rel),
         lambda: ref.mean_hin_aggregator_call(
@@ -354,7 +354,19 @@ def _():
 @case("APPNP_propagate k=10 (1500 x 1500, 64 -> 128)")
 def _():
     a, x = graph(1500, 64)
-    model = sg.APPNP([64], None, teleport_probability=0.15)
+    # `propagate` only reads `teleport_probability`, so the generator the
+    # constructor validates is a throwaway over a four-node graph
+    tiny, _ = graph(4, 2)
+
+    class G:
+        node_list = np.arange(4)
+        edges = np.array(np.nonzero(tiny), dtype=np.int64).T
+        features = np.ascontiguousarray(np.zeros((4, 2)))
+
+    model = sg.APPNP(
+        [64], [None], sg.FullBatchNodeGenerator(G(), method="gcn"),
+        teleport_probability=0.15,
+    )
     return (
         lambda: model.propagate(x, a, 10),
         lambda: ref.appnp_propagate(x, a, 10, 0.15),
@@ -395,7 +407,7 @@ def _():
 
 
 # ------------------------------------- stellargraph/data/explorer.py
-@case("UniformRandomWalk 200k walks of length 10 (100k nodes)")
+@case("UniformRandomWalk 50k walks of length 10 (100k nodes)")
 def _():
     rng = np.random.default_rng(8)
     n = 100000
@@ -405,7 +417,7 @@ def _():
     edges = np.stack([rows, cols], axis=1)
     walker = sg.UniformRandomWalk(edges, n)
     indptr, colind = sg.csr_from_edges(edges, n)
-    roots = np.arange(0, n, 2)
+    roots = np.arange(0, n, 8)
     return (
         lambda: walker.run(roots, 4, 10, 42),
         lambda: ref.uniform_random_walk(indptr, colind, roots, 4, 10, 42),
@@ -424,7 +436,7 @@ def _():
     indptr, colind = sg.csr_from_edges(edges, n)
     roots = np.arange(0, n, 2)
     return (
-        lambda: walker.run(roots, 2, 10, 0.5, 2.0, 42),
+        lambda: walker.run(roots, 2, p=0.5, q=2.0, length=10, seed=42),
         lambda: ref.biased_random_walk(indptr, colind, roots, 2, 0.5, 2.0, 10, 42),
     )
 

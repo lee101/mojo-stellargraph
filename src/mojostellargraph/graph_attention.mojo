@@ -16,13 +16,14 @@ from mojostellargraph.sparse import sparse_dense_matmul, sparse_softmax
 from mojostellargraph.types import (
     FPtr,
     IPtr,
-    activation,
+    Vec,
+    W,
+    activation_inplace,
     dot,
     dot_vec,
     iget,
-    iput,
     leaky_relu,
-    softmax_rows,
+    softmax_row,
 )
 
 comptime HEADS_REDUCTION_CONCAT = 0
@@ -59,67 +60,76 @@ def _head_dense(
     dot_vec(features, attn_kernel + units, attn_neighs, n, units)
 
     # dense = attn_for_self + K.transpose(attn_for_neighs)    (n x n)
-    for i in range(n):
-        for j in range(n):
-            dense.unsafe_store(
-                i * n + j, attn_self.unsafe_load(i) + attn_neighs.unsafe_load(j)
-            )
-
     # dense = LeakyReLU(alpha=0.2)(dense)
-    for i in range(n * n):
-        dense.unsafe_store(i, leaky_relu(dense.unsafe_load(i), 0.2))
-
-    if not saliency_map_support:
-        # mask = -10e9 * (1.0 - A)
-        # dense += mask
-        # dense = K.softmax(dense)                            Eq. 3
-        for i in range(n):
-            for j in range(n):
-                dense.unsafe_store(
-                    i * n + j,
-                    dense.unsafe_load(i * n + j)
-                    - 1e10 * (1.0 - a.unsafe_load(i * n + j)),
-                )
-        softmax_rows(dense, n, n)
-    else:
-        # GAT with support for saliency calculations
-        # W = (delta * A) * exp(dense - max(dense, axis=1, keepdims=True))
-        #       * (1 - non_exist_edge)
-        #     + non_exist_edge * (A + delta * (ones - A) + eye(N))
-        #       * exp(dense - max(dense, axis=1, keepdims=True))
-        # dense = W / K.sum(W, axis=1, keepdims=True)
-        for i in range(n):
-            var m = -1.7976931348623157e308
-            for j in range(n):
-                m = max(m, dense.unsafe_load(i * n + j))
+    # dense += -10e9 * (1.0 - A)                              Eq. 3 mask
+    # The three statements are one pass over an `[n, n]` block upstream
+    # keeps in three temporaries, and the row max both softmaxes need
+    # rides along in the same pass.
+    for i in range(n):
+        var drow = dense.unsafe_offset(i * n)
+        var arow = a.unsafe_offset(i * n)
+        var self_v = attn_self.unsafe_load(i)
+        var m = -1.7976931348623157e308
+        var j = 0
+        while j + W <= n:
+            var u = Vec(self_v) + attn_neighs.unsafe_load[width=W](j)
+            var v = max(u, Vec(0.2) * u)
+            if not saliency_map_support:
+                v = v - Vec(1e10) * (Vec(1.0) - arow.unsafe_load[width=W](j))
+            drow.unsafe_store(j, v)
+            m = max(m, v.reduce_max())
+            j += W
+        while j < n:
+            var v = leaky_relu(self_v + attn_neighs.unsafe_load(j), 0.2)
+            if not saliency_map_support:
+                v = v - 1e10 * (1.0 - arow.unsafe_load(j))
+            drow.unsafe_store(j, v)
+            m = max(m, v)
+            j += 1
+        if not saliency_map_support:
+            softmax_row(dense, i, n, m)
+        else:
+            # GAT with support for saliency calculations
+            # W = (delta * A) * exp(dense - max(dense, axis=1, keepdims=True))
+            #       * (1 - non_exist_edge)
+            #     + non_exist_edge * (A + delta * (ones - A) + eye(N))
+            #       * exp(dense - max(dense, axis=1, keepdims=True))
+            # dense = W / K.sum(W, axis=1, keepdims=True)
             var s = 0.0
-            for j in range(n):
-                var av = a.unsafe_load(i * n + j)
+            j = 0
+            while j < n:
+                var av = arow.unsafe_load(j)
                 var eye = 1.0 if i == j else 0.0
+                var e = exp(drow.unsafe_load(j) - m)
                 var w = (
-                    delta
-                    * av
-                    * exp(dense.unsafe_load(i * n + j) - m)
-                    * (1.0 - non_exist_edge)
-                    + non_exist_edge
-                    * (av + delta * (1.0 - av) + eye)
-                    * exp(dense.unsafe_load(i * n + j) - m)
+                    delta * av * e * (1.0 - non_exist_edge)
+                    + non_exist_edge * (av + delta * (1.0 - av) + eye) * e
                 )
-                dense.unsafe_store(i * n + j, w)
+                drow.unsafe_store(j, w)
                 s += w
-            for j in range(n):
-                dense.unsafe_store(i * n + j, dense.unsafe_load(i * n + j) / s)
-
+                j += 1
+            var inv = 1.0 / s
+            j = 0
+            while j + W <= n:
+                drow.unsafe_store(j, drow.unsafe_load[width=W](j) * inv)
+                j += W
+            while j < n:
+                drow.unsafe_store(j, drow.unsafe_load(j) * inv)
+                j += 1
     # node_features = K.dot(dropout_attn, dropout_feat)
     dot(dense, features, result, n, n, units)
 
     # if self.use_bias: node_features = K.bias_add(node_features, self.biases[head])
     if use_bias:
         for i in range(n):
-            for j in range(units):
-                result.unsafe_store(
-                    i * units + j, result.unsafe_load(i * units + j) + bias.unsafe_load(j)
-                )
+            var drow = result.unsafe_offset(i * units)
+            var j = 0
+            while j + W <= units:
+                drow.unsafe_store(j, drow.unsafe_load[width=W](j) + bias.unsafe_load[width=W](j))
+                j += W
+            while j < units:
+                drow.unsafe_store(j, drow.unsafe_load(j) + bias.unsafe_load(j))
+                j += 1
 
 
 def GraphAttention_call(
@@ -187,26 +197,51 @@ def GraphAttention_call(
     # Aggregate the heads' output according to the reduction method
     if attn_heads_reduction == HEADS_REDUCTION_CONCAT:
         for i in range(n):
+            var drow = result.unsafe_offset(i * out_dim)
             for h in range(attn_heads):
-                for j in range(units):
-                    result.unsafe_store(
-                        i * out_dim + h * units + j,
-                        work2.unsafe_load(h * n * units + i * units + j),
-                    )
+                var srow = work2.unsafe_offset(h * n * units + i * units)
+                var j = 0
+                while j + W <= units:
+                    drow.unsafe_store(h * units + j, srow.unsafe_load[width=W](j))
+                    j += W
+                while j < units:
+                    drow.unsafe_store(h * units + j, srow.unsafe_load(j))
+                    j += 1
     else:
+        var inv = 1.0 / Float64(attn_heads)
         for i in range(n):
-            for j in range(units):
-                var acc = 0.0
-                for h in range(attn_heads):
-                    acc += work2.unsafe_load(h * n * units + i * units + j)
-                result.unsafe_store(i * out_dim + j, acc / Float64(attn_heads))
+            var drow = result.unsafe_offset(i * out_dim)
+            var srow = work2.unsafe_offset(i * units)
+            var j = 0
+            while j + W <= units:
+                drow.unsafe_store(j, srow.unsafe_load[width=W](j))
+                j += W
+            while j < units:
+                drow.unsafe_store(j, srow.unsafe_load(j))
+                j += 1
+            var h = 1
+            while h < attn_heads:
+                srow = srow.unsafe_offset(n * units)
+                j = 0
+                while j + W <= units:
+                    drow.unsafe_store(
+                        j, drow.unsafe_load[width=W](j) + srow.unsafe_load[width=W](j)
+                    )
+                    j += W
+                while j < units:
+                    drow.unsafe_store(j, drow.unsafe_load(j) + srow.unsafe_load(j))
+                    j += 1
+                h += 1
+            j = 0
+            while j + W <= units:
+                drow.unsafe_store(j, drow.unsafe_load[width=W](j) * inv)
+                j += W
+            while j < units:
+                drow.unsafe_store(j, drow.unsafe_load(j) * inv)
+                j += 1
 
     # output = self.activation(output)
-    activation(result, work, n, out_dim, act, alpha)
-    var o = 0
-    while o < n * out_dim:
-        result.unsafe_store(o, work.unsafe_load(o))
-        o += 1
+    activation_inplace(result, n, out_dim, act, alpha)
 
     # if self.final_layer: output = K.gather(output, out_indices)
     # The gather is staged in `work` first: `out_indices` need not be sorted,
@@ -281,10 +316,14 @@ def _head_sparse(
     # if self.use_bias: node_features = K.bias_add(node_features, self.biases[head])
     if use_bias:
         for i in range(n):
-            for j in range(units):
-                result.unsafe_store(
-                    i * units + j, result.unsafe_load(i * units + j) + bias.unsafe_load(j)
-                )
+            var drow = result.unsafe_offset(i * units)
+            var j = 0
+            while j + W <= units:
+                drow.unsafe_store(j, drow.unsafe_load[width=W](j) + bias.unsafe_load[width=W](j))
+                j += W
+            while j < units:
+                drow.unsafe_store(j, drow.unsafe_load(j) + bias.unsafe_load(j))
+                j += 1
 
 
 def GraphAttentionSparse_call(
@@ -312,10 +351,8 @@ def GraphAttentionSparse_call(
     final_layer: Int,
 ):
     """Upstream `GraphAttentionSparse.call` with the batch dimension removed."""
-    var out_dim = 0
-    if attn_heads_reduction == HEADS_REDUCTION_CONCAT:
-        out_dim = units * attn_heads
-    else:
+    var out_dim = units * attn_heads
+    if attn_heads_reduction != HEADS_REDUCTION_CONCAT:
         out_dim = units
 
     # Scratch: work holds [n*units features | n attn_self | n attn_neighs |
@@ -345,25 +382,50 @@ def GraphAttentionSparse_call(
 
     if attn_heads_reduction == HEADS_REDUCTION_CONCAT:
         for i in range(n):
+            var drow = result.unsafe_offset(i * out_dim)
             for h in range(attn_heads):
-                for j in range(units):
-                    result.unsafe_store(
-                        i * out_dim + h * units + j,
-                        work2.unsafe_load(h * n * units + i * units + j),
-                    )
+                var srow = work2.unsafe_offset(h * n * units + i * units)
+                var j = 0
+                while j + W <= units:
+                    drow.unsafe_store(h * units + j, srow.unsafe_load[width=W](j))
+                    j += W
+                while j < units:
+                    drow.unsafe_store(h * units + j, srow.unsafe_load(j))
+                    j += 1
     else:
+        var inv = 1.0 / Float64(attn_heads)
         for i in range(n):
-            for j in range(units):
-                var acc = 0.0
-                for h in range(attn_heads):
-                    acc += work2.unsafe_load(h * n * units + i * units + j)
-                result.unsafe_store(i * out_dim + j, acc / Float64(attn_heads))
+            var drow = result.unsafe_offset(i * out_dim)
+            var srow = work2.unsafe_offset(i * units)
+            var j = 0
+            while j + W <= units:
+                drow.unsafe_store(j, srow.unsafe_load[width=W](j))
+                j += W
+            while j < units:
+                drow.unsafe_store(j, srow.unsafe_load(j))
+                j += 1
+            var h = 1
+            while h < attn_heads:
+                srow = srow.unsafe_offset(n * units)
+                j = 0
+                while j + W <= units:
+                    drow.unsafe_store(
+                        j, drow.unsafe_load[width=W](j) + srow.unsafe_load[width=W](j)
+                    )
+                    j += W
+                while j < units:
+                    drow.unsafe_store(j, drow.unsafe_load(j) + srow.unsafe_load(j))
+                    j += 1
+                h += 1
+            j = 0
+            while j + W <= units:
+                drow.unsafe_store(j, drow.unsafe_load[width=W](j) * inv)
+                j += W
+            while j < units:
+                drow.unsafe_store(j, drow.unsafe_load(j) * inv)
+                j += 1
 
-    activation(result, work, n, out_dim, act, alpha)
-    var o = 0
-    while o < n * out_dim:
-        result.unsafe_store(o, work.unsafe_load(o))
-        o += 1
+    activation_inplace(result, n, out_dim, act, alpha)
 
     # The gather is staged in `work` first: `out_indices` need not be sorted,
     # and writing straight into `result` would read a row already overwritten.

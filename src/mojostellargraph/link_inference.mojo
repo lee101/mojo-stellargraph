@@ -9,7 +9,14 @@ of node embeddings to an edge prediction. The closure is a seven-way branch on
 upstream's order.
 """
 
-from mojostellargraph.types import FPtr, activation, relu
+from mojostellargraph.types import (
+    FPtr,
+    Vec,
+    W,
+    activation_inplace,
+    dot,
+    relu,
+)
 
 # Upstream compares `edge_embedding_method` against strings; a C ABI call
 # cannot carry one, so these codes stand in and the Python wrapper keeps the
@@ -36,13 +43,22 @@ def LeakyClippedLinear_call(
     x_lo = K.relu(self.lo - x)
     x_hi = K.relu(x - self.hi)
     return x + self.gamma * x_lo - self.gamma * x_hi
+    ```
     """
     var gamma = 1.0 - alpha
-    for i in range(n):
+    var i = 0
+    while i + W <= n:
+        var t = x.unsafe_load[width=W](i)
+        var x_lo = max(Vec(low) - t, Vec(0.0))
+        var x_hi = max(t - Vec(high), Vec(0.0))
+        dst.unsafe_store(i, t + Vec(gamma) * x_lo - Vec(gamma) * x_hi)
+        i += W
+    while i < n:
         var t = x.unsafe_load(i)
         var x_lo = relu(low - t)
         var x_hi = relu(t - high)
         dst.unsafe_store(i, t + gamma * x_lo - gamma * x_hi)
+        i += 1
 
 
 def link_inference_edge_function(
@@ -85,72 +101,113 @@ def link_inference_edge_function(
     if method == IP or method == DOT:
         # out = K.sum(x[0] * x[1], axis=-1, keepdims=False)
         for i in range(n):
-            var acc = 0.0
-            for j in range(d):
-                acc += x0.unsafe_load(i * d + j) * x1.unsafe_load(i * d + j)
+            var r0 = x0.unsafe_offset(i * d)
+            var r1 = x1.unsafe_offset(i * d)
+            var c = SIMD[DType.float64, W](0.0)
+            var j = 0
+            while j + W <= d:
+                c = c + r0.unsafe_load[width=W](j) * r1.unsafe_load[width=W](j)
+                j += W
+            var acc = c.reduce_add()
+            while j < d:
+                acc += r0.unsafe_load(j) * r1.unsafe_load(j)
+                j += 1
             result.unsafe_store(i, acc)
         # result = Activation(output_act)(result)
-        activation(result, le, n, 1, act, alpha)
+        activation_inplace(result, n, 1, act, alpha)
         if clip:
-            LeakyClippedLinear_call(result, le, n, clip_low, clip_high, 0.1)
-        var k = 0
-        while k < n:
-            result.unsafe_store(k, le.unsafe_load(k))
-            k += 1
+            LeakyClippedLinear_call(result, result, n, clip_low, clip_high, 0.1)
         return 1
 
     if method == L1:
         # le = K.abs(x[0] - x[1])
         for i in range(n):
-            for j in range(d):
-                le.unsafe_store(
-                    i * d + j,
-                    abs(x0.unsafe_load(i * d + j) - x1.unsafe_load(i * d + j)),
-                )
+            var r0 = x0.unsafe_offset(i * d)
+            var r1 = x1.unsafe_offset(i * d)
+            var drow = le.unsafe_offset(i * d)
+            var j = 0
+            while j + W <= d:
+                drow.unsafe_store(j, abs(r0.unsafe_load[width=W](j) - r1.unsafe_load[width=W](j)))
+                j += W
+            while j < d:
+                drow.unsafe_store(j, abs(r0.unsafe_load(j) - r1.unsafe_load(j)))
+                j += 1
     elif method == L2:
         # le = K.square(x[0] - x[1])
         for i in range(n):
-            for j in range(d):
-                var t = x0.unsafe_load(i * d + j) - x1.unsafe_load(i * d + j)
-                le.unsafe_store(i * d + j, t * t)
+            var r0 = x0.unsafe_offset(i * d)
+            var r1 = x1.unsafe_offset(i * d)
+            var drow = le.unsafe_offset(i * d)
+            var j = 0
+            while j + W <= d:
+                var t = r0.unsafe_load[width=W](j) - r1.unsafe_load[width=W](j)
+                drow.unsafe_store(j, t * t)
+                j += W
+            while j < d:
+                var t = r0.unsafe_load(j) - r1.unsafe_load(j)
+                drow.unsafe_store(j, t * t)
+                j += 1
     elif method == MUL:
         # le = Multiply()([x0, x1])
         for i in range(n):
-            for j in range(d):
-                le.unsafe_store(
-                    i * d + j, x0.unsafe_load(i * d + j) * x1.unsafe_load(i * d + j)
-                )
+            var r0 = x0.unsafe_offset(i * d)
+            var r1 = x1.unsafe_offset(i * d)
+            var drow = le.unsafe_offset(i * d)
+            var j = 0
+            while j + W <= d:
+                drow.unsafe_store(j, r0.unsafe_load[width=W](j) * r1.unsafe_load[width=W](j))
+                j += W
+            while j < d:
+                drow.unsafe_store(j, r0.unsafe_load(j) * r1.unsafe_load(j))
+                j += 1
     elif method == CONCAT:
         # le = Concatenate()([x0, x1])
         for i in range(n):
-            for j in range(d):
-                le.unsafe_store(i * 2 * d + j, x0.unsafe_load(i * d + j))
-                le.unsafe_store(i * 2 * d + d + j, x1.unsafe_load(i * d + j))
+            var r0 = x0.unsafe_offset(i * d)
+            var r1 = x1.unsafe_offset(i * d)
+            var drow = le.unsafe_offset(i * 2 * d)
+            var j = 0
+            while j + W <= d:
+                drow.unsafe_store(j, r0.unsafe_load[width=W](j))
+                drow.unsafe_store(j + d, r1.unsafe_load[width=W](j))
+                j += W
+            while j < d:
+                drow.unsafe_store(j, r0.unsafe_load(j))
+                drow.unsafe_store(j + d, r1.unsafe_load(j))
+                j += 1
     elif method == AVG:
         # le = Average()([x0, x1])
         for i in range(n):
-            for j in range(d):
-                le.unsafe_store(
-                    i * d + j,
-                    (x0.unsafe_load(i * d + j) + x1.unsafe_load(i * d + j)) / 2.0,
+            var r0 = x0.unsafe_offset(i * d)
+            var r1 = x1.unsafe_offset(i * d)
+            var drow = le.unsafe_offset(i * d)
+            var j = 0
+            while j + W <= d:
+                drow.unsafe_store(
+                    j, (r0.unsafe_load[width=W](j) + r1.unsafe_load[width=W](j)) / 2.0
                 )
+                j += W
+            while j < d:
+                drow.unsafe_store(j, (r0.unsafe_load(j) + r1.unsafe_load(j)) / 2.0)
+                j += 1
 
     # Dense(output_dim, activation=output_act): `kernel` is the Keras
     # `(in_dim, output_dim)` weight, row-major.
     var in_dim = 2 * d if method == CONCAT else d
-    for i in range(n):
-        for j in range(output_dim):
-            var acc = 0.0
-            for c in range(in_dim):
-                acc += le.unsafe_load(i * in_dim + c) * kernel.unsafe_load(c * output_dim + j)
-            if has_bias:
-                acc += bias.unsafe_load(j)
-            result.unsafe_store(i * output_dim + j, acc)
-    activation(result, le, n, output_dim, act, alpha)
+    dot(le, kernel, result, n, in_dim, output_dim)
+    if has_bias:
+        for i in range(n):
+            var drow = result.unsafe_offset(i * output_dim)
+            var j = 0
+            while j + W <= output_dim:
+                drow.unsafe_store(
+                    j, drow.unsafe_load[width=W](j) + bias.unsafe_load[width=W](j)
+                )
+                j += W
+            while j < output_dim:
+                drow.unsafe_store(j, drow.unsafe_load(j) + bias.unsafe_load(j))
+                j += 1
+    activation_inplace(result, n, output_dim, act, alpha)
     if clip:
-        LeakyClippedLinear_call(result, le, n * output_dim, clip_low, clip_high, 0.1)
-    var k = 0
-    while k < n * output_dim:
-        result.unsafe_store(k, le.unsafe_load(k))
-        k += 1
+        LeakyClippedLinear_call(result, result, n * output_dim, clip_low, clip_high, 0.1)
     return output_dim

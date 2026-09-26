@@ -346,6 +346,23 @@ def mean_hin_aggregator_call(x_self, x_neigh, w_self, w_neigh, bias=None,
     return _activation(total, act)
 
 
+def hinsage_model_call(head, neighbourhoods, aggs, normalize="l2"):
+    """`HinSAGE.__call__`: one aggregator per layer in order, then
+    `self._normalization`, which is `K.l2_normalize(x, axis=-1)` for
+    `normalize="l2"` and the identity otherwise."""
+    h = head
+    for agg, rel in zip(aggs, neighbourhoods):
+        h = mean_hin_aggregator_call(
+            h, rel, agg.w_self, agg.w_neigh, agg.bias, agg.act
+        )
+    if normalize is None or normalize == "none":
+        return h
+    # `K.l2_normalize(x, axis=-1)`, with TensorFlow's 1e-7 clamp on the norm
+    flat = h.reshape(-1, h.shape[-1])
+    norms = np.maximum(np.sqrt((flat ** 2).sum(axis=1, keepdims=True)), 1e-7)
+    return (flat / norms).reshape(h.shape)
+
+
 # ------------------------------------------- stellargraph/layer/ppnp.py
 def ppnp_propagation_layer_call(features, A, out_indices=None):
     output = A @ features
@@ -368,6 +385,40 @@ def appnp_propagate(x, A, k, teleport_probability=0.1):
     for _ in range(k):
         z = (1 - teleport_probability) * (A @ z) + teleport_probability * x
     return z
+
+
+def _dense_stack(h, layers):
+    """The `Dense(l, activation=a, use_bias=b)` stack both models prepend, as
+    upstream's `__init__` builds it: one `Dropout` and one `Dense` per entry,
+    the activation inside the `Dense` and the bias optional."""
+    for kernel, bias, act in layers:
+        h = h @ kernel
+        if bias is not None:
+            h = h + bias
+        h = _activation(h, act)
+    return h
+
+
+def ppnp_model_call(features, A, layers, out_indices=None):
+    """`PPNP.__call__`: the Dense stack, then one `PPNPPropagationLayer` with
+    `final_layer=True`."""
+    h = _dense_stack(features, layers)
+    return ppnp_propagation_layer_call(h, A, out_indices)
+
+
+def appnp_model_call(features, A, layers, teleport_probability=0.1,
+                     approx_iter=10, out_indices=None):
+    """`APPNP.__call__`: the Dense stack, then `approx_iter`
+    `APPNPPropagationLayer`s of which the last carries
+    `final_layer=(ii == approx_iter - 1)`."""
+    h = _dense_stack(features, layers)
+    feature_layer = h
+    for ii in range(approx_iter):
+        h = appnp_propagation_layer_call(
+            h, feature_layer, A, teleport_probability,
+            out_indices if ii == approx_iter - 1 else None,
+        )
+    return h
 
 
 # ---------------------------------- stellargraph/layer/link_inference.py

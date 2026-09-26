@@ -17,6 +17,7 @@ LIB = os.environ.get("MOJOSTELLARGRAPH_LIB") or os.path.join(
 )
 
 I = ctypes.c_int64
+U = ctypes.c_uint64
 F = ctypes.c_double
 
 # Kept in step with `src/capi.mojo` by hand: every export is a flat list of
@@ -61,9 +62,9 @@ _SIGNATURES: dict[str, tuple[list, object]] = {
         [I, I, I, I, I, I, I, I, I, I, I, I, I, I],
         None,
     ),
-    "msg_AttentionalAggregator_call": ([I, I, I, I, I, I, I, I, I, I, F], None),
+    "msg_AttentionalAggregator_call": ([I, I, I, I, I, I, I, I, F], None),
     "msg_GraphSAGEAggregator_call": (
-        [I, I, I, I, I, I, I, I, I, I, F],
+        [I, I, I, I, I, I, I, I, F],
         None,
     ),
     "msg_GraphSAGE_normalization": ([I, I, I, I, I], None),
@@ -83,12 +84,12 @@ _SIGNATURES: dict[str, tuple[list, object]] = {
         I,
     ),
     # stellargraph/data/explorer.py
-    "msg_naive_weighted_choices": ([I, I, I, I, I, I], I),
+    "msg_naive_weighted_choices": ([I, I, I, I, I, U], I),
     "msg_uniform_random_walk": ([I, I, I, I, I, I, I, I, I, I], None),
     "msg_biased_random_walk": ([I, I, I, I, I, I, I, I, I, I, I, F, F, I], None),
     # sparse helpers behind the two upstream TensorFlow sparse ops
-    "msg_coo_to_csr": ([I, I, I, I, I, I, I, I, I], None),
-    "msg_sparse_dense_matmul": ([I, I, I, I, I, I, I], None),
+    "msg_coo_to_csr": ([I, I, I, I, I, I, I, I, I, I], I),
+    "msg_sparse_dense_matmul": ([I, I, I, I, I, I, I, I], None),
 }
 
 
@@ -160,6 +161,19 @@ def f64(a) -> np.ndarray:
 def i32(a) -> np.ndarray:
     """A C-contiguous int32 view of `a`; node indices are narrow upstream too."""
     return np.ascontiguousarray(a, dtype=np.int32)
+
+
+def node_indices(a, n: int) -> np.ndarray:
+    """C-contiguous int32 node indices, every one of them a node of an `n`-node
+    graph. The kernels index straight into the result with no bound of their
+    own, so an out-of-range value is an out-of-bounds read, not a wrong number.
+    """
+    out = i32(np.asarray(a).reshape(-1))
+    if out.size and (int(out.min()) < 0 or int(out.max()) >= n):
+        raise IndexError(
+            "node index out of range for a graph of {} nodes".format(n)
+        )
+    return out
 
 
 def addr(a: np.ndarray) -> int:
