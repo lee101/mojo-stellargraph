@@ -61,6 +61,110 @@ def LeakyClippedLinear_call(
         i += 1
 
 
+def _scale_half(x: FPtr, count: Int):
+    """`x[:count] *= 0.5`, in place: the `Average()` of the concat operators."""
+    var half = Vec(0.5)
+    var i = 0
+    while i + W <= count:
+        x.unsafe_store(i, x.unsafe_load[width=W](i) * half)
+        i += W
+    while i < count:
+        x.unsafe_store(i, x.unsafe_load(i) * 0.5)
+        i += 1
+
+
+def _dot_concat(
+    x0: FPtr, x1: FPtr, kernel: FPtr, dst: FPtr, n: Int, d: Int, out_dim: Int
+):
+    """`dst[i] = concat([x0[i], x1[i]]) @ kernel`, without the concatenation.
+
+    Two rows of the virtual `[n, 2 * d]` left operand are contracted at once, so
+    each `kernel` column is read once for both rows and the concatenation itself
+    is never stored. `a0`/`b0` are the two `d`-runs of row `i` and `a1`/`b1`
+    the same of row `i + 1`.
+    """
+    var i = 0
+    while i + 2 <= n:
+        # row i:     x0[i] supplies kernel[0:d]   and x1[i] supplies kernel[d:2d]
+        # row i + 1: x0[i+1] supplies kernel[0:d] and x1[i+1] supplies kernel[d:2d]
+        var a0 = x0.unsafe_offset(i * d)
+        var b0 = x1.unsafe_offset(i * d)
+        var a1 = x0.unsafe_offset((i + 1) * d)
+        var b1 = x1.unsafe_offset((i + 1) * d)
+        var d0 = dst.unsafe_offset(i * out_dim)
+        var d1 = d0.unsafe_offset(out_dim)
+        var j = 0
+        while j + 2 * W <= out_dim:
+            # two output column blocks at a time, and both rows: `k*` is row `i`
+            # and `c*` row `i + 1`, each accumulator folding that row's
+            # `kernel[0:d]` and `kernel[d:2d]` halves together
+            var k0 = Vec(0.0)
+            var k1 = Vec(0.0)
+            var c0 = Vec(0.0)
+            var c1 = Vec(0.0)
+            var t = 0
+            while t < d:
+                var lo = kernel.unsafe_load[width=W](t * out_dim + j)
+                var hi = kernel.unsafe_load[width=W](t * out_dim + j + W)
+                var lo2 = kernel.unsafe_load[width=W]((t + d) * out_dim + j)
+                var hi2 = kernel.unsafe_load[width=W]((t + d) * out_dim + j + W)
+                k0 = k0 + lo * a0.unsafe_load(t) + lo2 * b0.unsafe_load(t)
+                k1 = k1 + hi * a0.unsafe_load(t) + hi2 * b0.unsafe_load(t)
+                c0 = c0 + lo * a1.unsafe_load(t) + lo2 * b1.unsafe_load(t)
+                c1 = c1 + hi * a1.unsafe_load(t) + hi2 * b1.unsafe_load(t)
+                t += 1
+            d0.unsafe_store(j, k0)
+            d0.unsafe_store(j + W, k1)
+            d1.unsafe_store(j, c0)
+            d1.unsafe_store(j + W, c1)
+            j += 2 * W
+        while j < out_dim:
+            # the columns past the vector lanes: one at a time, both rows
+            var acc0 = 0.0
+            var acc1 = 0.0
+            var t = 0
+            while t < d:
+                acc0 += a0.unsafe_load(t) * kernel.unsafe_load(t * out_dim + j)
+                acc0 += b0.unsafe_load(t) * kernel.unsafe_load((t + d) * out_dim + j)
+                acc1 += a1.unsafe_load(t) * kernel.unsafe_load(t * out_dim + j)
+                acc1 += b1.unsafe_load(t) * kernel.unsafe_load((t + d) * out_dim + j)
+                t += 1
+            d0.unsafe_store(j, acc0)
+            d1.unsafe_store(j, acc1)
+            j += 1
+        i += 2
+    if i < n:
+        _dot_concat_row(x0.unsafe_offset(i * d), x1.unsafe_offset(i * d), kernel, dst.unsafe_offset(i * out_dim), d, out_dim)
+
+
+def _dot_concat_row(
+    arow: FPtr, brow: FPtr, kernel: FPtr, drow: FPtr, d: Int, out_dim: Int
+):
+    """`_dot_concat` for the odd row left over by its two-row blocking."""
+    var j = 0
+    while j + W <= out_dim:
+        var c0 = Vec(0.0)
+        var c1 = Vec(0.0)
+        var t = 0
+        while t < d:
+            var u = arow.unsafe_load(t)
+            var p = brow.unsafe_load(t)
+            c0 = c0 + kernel.unsafe_load[width=W](t * out_dim + j) * u
+            c1 = c1 + kernel.unsafe_load[width=W]((t + d) * out_dim + j) * p
+            t += 1
+        drow.unsafe_store(j, c0 + c1)
+        j += W
+    while j < out_dim:
+        var acc = 0.0
+        var t = 0
+        while t < d:
+            acc += arow.unsafe_load(t) * kernel.unsafe_load(t * out_dim + j)
+            acc += brow.unsafe_load(t) * kernel.unsafe_load((t + d) * out_dim + j)
+            t += 1
+        drow.unsafe_store(j, acc)
+        j += 1
+
+
 def link_inference_edge_function(
     x0: FPtr,
     x1: FPtr,
@@ -160,21 +264,6 @@ def link_inference_edge_function(
             while j < d:
                 drow.unsafe_store(j, r0.unsafe_load(j) * r1.unsafe_load(j))
                 j += 1
-    elif method == CONCAT:
-        # le = Concatenate()([x0, x1])
-        for i in range(n):
-            var r0 = x0.unsafe_offset(i * d)
-            var r1 = x1.unsafe_offset(i * d)
-            var drow = le.unsafe_offset(i * 2 * d)
-            var j = 0
-            while j + W <= d:
-                drow.unsafe_store(j, r0.unsafe_load[width=W](j))
-                drow.unsafe_store(j + d, r1.unsafe_load[width=W](j))
-                j += W
-            while j < d:
-                drow.unsafe_store(j, r0.unsafe_load(j))
-                drow.unsafe_store(j + d, r1.unsafe_load(j))
-                j += 1
     elif method == AVG:
         # le = Average()([x0, x1])
         for i in range(n):
@@ -183,18 +272,29 @@ def link_inference_edge_function(
             var drow = le.unsafe_offset(i * d)
             var j = 0
             while j + W <= d:
-                drow.unsafe_store(
-                    j, (r0.unsafe_load[width=W](j) + r1.unsafe_load[width=W](j)) / 2.0
-                )
+                drow.unsafe_store(j, r0.unsafe_load[width=W](j) + r1.unsafe_load[width=W](j))
                 j += W
             while j < d:
-                drow.unsafe_store(j, (r0.unsafe_load(j) + r1.unsafe_load(j)) / 2.0)
+                drow.unsafe_store(j, r0.unsafe_load(j) + r1.unsafe_load(j))
                 j += 1
+        # `Average()` is a divide by two; folding it in here as a second pass
+        # over the same block is cheaper than a divide in the loop above
+        _scale_half(le, n * d)
 
     # Dense(output_dim, activation=output_act): `kernel` is the Keras
     # `(in_dim, output_dim)` weight, row-major.
-    var in_dim = 2 * d if method == CONCAT else d
-    dot(le, kernel, result, n, in_dim, output_dim)
+    if method == CONCAT:
+        # `le = Concatenate()([x0, x1])` is upstream's statement, but the
+        # concatenation is never read: the `Dense` below consumes it once and
+        # nothing else looks at it. Materialising it is `2 * n * d` doubles
+        # stored and then re-read -- 400 MB of traffic at the benchmark's
+        # 200k x 64 -- to compute `x0 @ kernel[:d] + x1 @ kernel[d:]`. Doing
+        # that product directly reads both halves where they already are and
+        # writes neither. `le` stays allocated: it is the destination of the
+        # activation and the LeakyClippedLinear below.
+        _dot_concat(x0, x1, kernel, result, n, d, output_dim)
+    else:
+        dot(le, kernel, result, n, d, output_dim)
     if has_bias:
         for i in range(n):
             var drow = result.unsafe_offset(i * output_dim)

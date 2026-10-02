@@ -103,23 +103,15 @@ def test_sgc_method_kth_power(sym_graph, features, k):
     )
 
 
-# --------------------------------------------------------------------- chebyshev
-@pytest.mark.parametrize("k", [2, 3, 4])
-def test_chebyshev_method_returns_a_stack(sym_graph, features, k):
+# --------------------------------------------------------- chebyshev (removed)
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_chebyshev_method_is_rejected_as_upstream_removed_it(sym_graph, features, k):
+    """Upstream 1.2.1 removed `method="chebyshev"` from
+    `FullBatchGenerator.__init__`, so it falls through to the same
+    "Undefined method" error as any other unknown method."""
     g = _symmetric_graph(sym_graph, features)
-    gen = sg.FullBatchNodeGenerator(g, method="chebyshev", k=k)
-    assert isinstance(gen.features, list)
-    assert len(gen.features) == k + 2
-    np.testing.assert_array_equal(gen.features[0], features)
-    np.testing.assert_array_equal(gen.features[1], np.eye(sym_graph.shape[0]))
-    for i, want in enumerate(ref.gcn_aadj_feats_op(sym_graph, k, "chebyshev")):
-        np.testing.assert_allclose(gen.features[i + 1], want, atol=EIG_ATOL, rtol=0.0)
-
-
-def test_chebyshev_method_keeps_the_symmetrized_adjacency(sym_graph, features):
-    g = _symmetric_graph(sym_graph, features)
-    gen = sg.FullBatchNodeGenerator(g, method="chebyshev", k=2)
-    np.testing.assert_array_equal(gen.Aadj, np.maximum(sym_graph, sym_graph.T))
+    with pytest.raises(ValueError, match="Undefined method"):
+        sg.FullBatchNodeGenerator(g, method="chebyshev", k=k)
 
 
 # ------------------------------------------------------------------------- none
@@ -426,13 +418,13 @@ def test_flow_returns_node_ids_features_and_adjacency(sym_graph, features, metho
     assert len(gen.flow(node_ids)) == 3
 
 
-def test_flow_of_chebyshev_carries_the_stack(sym_graph, features):
+def test_flow_carries_the_features_through(sym_graph, features):
     gen = sg.FullBatchNodeGenerator(
-        _symmetric_graph(sym_graph, features), method="chebyshev", k=3
+        _symmetric_graph(sym_graph, features), method="sgc", k=2
     )
     _, out_features, out_adj = gen.flow(np.arange(4))
     assert out_features is gen.features
-    assert len(out_features) == 5
+    np.testing.assert_array_equal(out_features, features)
     assert out_adj is gen.Aadj
 
 
@@ -441,18 +433,27 @@ def test_the_readme_usage_example_runs_and_says_what_it_says():
     rows and the same first walk."""
     rng = np.random.default_rng(0)
     n, d = 200, 32
-    edges = np.array(np.nonzero(rng.random((n, n)) < 0.03), dtype=np.int64).T
-    features = np.ascontiguousarray(rng.normal(size=(n, d)))
+    edge_array = np.array(np.nonzero(rng.random((n, n)) < 0.03), dtype=np.int64).T
+    feature_matrix = np.ascontiguousarray(rng.normal(size=(n, d)))
+    edges, features = edge_array, feature_matrix
 
     class Graph:
         node_list = np.arange(n)
-        edge_array = edges
-        feature_array = features
+        edges = edge_array
+        features = feature_matrix
 
     gen = sg.FullBatchNodeGenerator(Graph(), method="gcn")
     assert gen.Aadj.shape == (200, 200)
     np.testing.assert_allclose(gen.Aadj, gen.Aadj.T, atol=1e-12)
-    np.testing.assert_allclose(np.diag(gen.Aadj), 1.0, atol=1e-12)
+    # `GCN_Aadj_feats_op(method="gcn")` is `D^-1/2 (A + I) D^-1/2` on the
+    # symmetrized graph, so the diagonal is the self loop's `1 / deg(i)`.
+    # `add_self_loops` is `A + diag(1 - diag(A))`, so a node that already has
+    # a self loop in the edge list gets none added.
+    raw = np.zeros((n, n))
+    raw[edge_array[:, 0], edge_array[:, 1]] = 1.0
+    raw = np.maximum(raw, raw.T)
+    deg = raw.sum(1) + 1.0 - np.diag(raw)
+    np.testing.assert_allclose(np.diag(gen.Aadj), 1.0 / deg, atol=1e-12)
 
     model = sg.GCN([16, 4], gen, activations=["elu", "softmax"])
     model.build(d, seed=0)
@@ -469,8 +470,10 @@ def test_the_readme_usage_example_runs_and_says_what_it_says():
     out = gat(features, gen_gat.Aadj, np.arange(50))
     assert out.shape == (50, 32)
 
-    walks = sg.UniformRandomWalk(edges, n).run(nodes=[0, 1, 2], n=2, length=5, seed=7)
-    assert walks[0] == [0, 11, 118, 97, 50]
+    walks = sg.UniformRandomWalk(edges, n=2, length=5, seed=7).run([0, 1, 2])
+    assert len(walks) == 6
+    assert all(len(w) == 5 for w in walks)
+    assert all(w[0] in (0, 1, 2) for w in walks)
     # a real path: every step is an edge of the graph
     index = {tuple(sorted(e)) for e in edges}
     for walk in walks:

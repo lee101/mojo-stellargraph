@@ -35,7 +35,6 @@ def pcg_bounded(state: UInt64, bound: Int) -> Int:
         s = pcg_next(s)
         if (s >> 32) < threshold:
             return Int((s >> 32) % UInt64(bound))
-    return 0
 
 
 def pcg_uniform(state: UInt64) -> Float64:
@@ -132,25 +131,27 @@ def naive_weighted_choices(
     node: Int,
     state: UInt64,
 ) -> Int:
-    """Upstream `naive_weighted_choices(rs, weights)`.
+    """Upstream `naive_weighted_choices(rs, weights, size=None)`.
 
     ```
-    subinterval_ends = []
-    running_total = 0
-    for w in weights:
-        if w < 0: raise ValueError(...)
-        running_total += w
-        subinterval_ends.append(running_total)
-    x = rs.random() * running_total
-    for idx, end in enumerate(subinterval_ends):
-        if x < end: break
-    return idx
+    probs = np.cumsum(weights)
+    total = probs[-1]
+    if total == 0:
+        return None
+    thresholds = rs.random() if size is None else rs.random(size)
+    idx = np.searchsorted(probs, thresholds * total, side="left")
     ```
 
     `work` is the running-total scratch. A negative weight is upstream's one
     error path; it is reported by returning `-1`. A node with no neighbours has
     no interval to sample from, so it returns `-2` rather than reading
     `colind[lo - 1]`, which is outside the buffer.
+
+    `side="left"` means the first index whose running total is `>= x`, so the
+    scan below tests `x <= running` rather than the older v0.8.1 `x < running`.
+    The two differ only when a weight is exactly zero, where upstream can
+    return the index of that empty sub-interval; the test is kept exact so the
+    kernel and `naive_weighted_choices` in Python agree.
     """
     var lo = Int(iget(indptr, node))
     var deg = Int(iget(indptr, node + 1)) - lo
@@ -165,10 +166,14 @@ def naive_weighted_choices(
         total += w
         work.unsafe_store(k, total)
         k += 1
+    if total == 0.0:
+        # upstream: `if total == 0: return None`
+        return -3
     var x = pcg_uniform(state) * total
+    # first index with `work[idx] >= x`
     var idx = 0
     while idx < deg:
-        if x < work.unsafe_load(idx):
+        if x <= work.unsafe_load(idx):
             break
         idx += 1
     if idx >= deg:
@@ -186,6 +191,7 @@ def _contains(items: IPtr, m: Int, value: Int) -> Bool:
 def biased_random_walk(
     indptr: IPtr,
     colind: IPtr,
+    edge_weights_addr: Int,
     root_nodes: IPtr,
     walks_out: IPtr,
     lens_out: IPtr,
@@ -198,45 +204,43 @@ def biased_random_walk(
     p: Float64,
     q: Float64,
     seed: Int,
+    weighted: Int,
 ):
-    """Upstream `BiasedRandomWalk.run(nodes, n, p=1.0, q=1.0, length, seed)`.
+    """Upstream `BiasedRandomWalk.run`.
 
     ```
-    ip = 1.0 / p
-    iq = 1.0 / q
+    ip = cast(1.0 / p); iq = cast(1.0 / q)
     for node in nodes:
         for walk_number in range(n):
             walk = [node]
-            neighbours = self.neighbors(node)
-            previous_node = node
-            previous_node_neighbours = neighbours
-
-            def transition_probability(nn, current_node, weighted, edge_weight_label):
-                weight_cn = 1.0                       # unweighted walk
-                if nn == previous_node:               # d_tx = 0
-                    return ip * weight_cn
-                elif nn in previous_node_neighbours:  # d_tx = 1
-                    return 1.0 * weight_cn
-                else:                                 # d_tx = 2
-                    return iq * weight_cn
-
-            if neighbours:
-                current_node = rs.choice(neighbours)
-                for _ in range(length - 1):
-                    walk.append(current_node)
-                    neighbours = self.neighbors(current_node)
-                    if not neighbours:
-                        break
-                    choice = naive_weighted_choices(rs, transition_probability(nn, ...))
-                    previous_node = current_node
-                    previous_node_neighbours = neighbours
-                    current_node = neighbours[choice]
+            previous_node = None
+            previous_node_neighbours = []
+            current_node = node
+            for _ in range(length - 1):
+                if weighted:
+                    neighbours, weights = self.graph.neighbor_arrays(current_node, include_edge_weight=True, use_ilocs=True)
+                else:
+                    neighbours = self.graph.neighbor_arrays(current_node, use_ilocs=True)
+                    weights = np.ones(neighbours.shape, dtype=weight_dtype)
+                if len(neighbours) == 0: break
+                mask = neighbours == previous_node
+                weights[mask] *= ip
+                mask |= np.isin(neighbours, previous_node_neighbours)
+                weights[~mask] *= iq
+                choice = naive_weighted_choices(rs, weights)
+                if choice is None: break
+                previous_node = current_node
+                previous_node_neighbours = neighbours
+                current_node = neighbours[choice]
+                walk.append(current_node)
             walks.append(walk)
     ```
 
-    Only the unweighted walk is ported: upstream's `weighted=True` reads a
-    per-edge label off a `networkx` graph, which this port has no graph object
-    for. See the README.
+    A pointer is non-nullable, so `edge_weights_addr` arrives as an `Int` and is
+    rebuilt only inside the `weighted != 0` branch that reads it. When
+    `weighted == 0` the Python side still passes a live (if unread) buffer,
+    because a pointer has no null state here; every transition weight is then
+    the constant `1.0` upstream builds with `np.ones(neighbours.shape)`.
     """
     var state = UInt64(seed) + PCG_INCR
     var ip = 1.0 / p
@@ -273,15 +277,29 @@ def biased_random_walk(
 
                     # transition_probability over the current node's neighbours
                     k = 0
-                    while k < cdeg:
-                        var nn = Int(iget(colind, clo + k))
-                        if nn == previous_node:
-                            work2.unsafe_store(k, ip)
-                        elif _contains(indices, deg, nn):
-                            work2.unsafe_store(k, 1.0)
-                        else:
-                            work2.unsafe_store(k, iq)
-                        k += 1
+                    if weighted != 0:
+                        var w_ptr = FPtr(unsafe_from_address=edge_weights_addr)
+                        while k < cdeg:
+                            var nn = Int(iget(colind, clo + k))
+                            var weight_cn = w_ptr.unsafe_load(clo + k)
+                            if nn == previous_node:
+                                work2.unsafe_store(k, ip * weight_cn)
+                            elif _contains(indices, deg, nn):
+                                work2.unsafe_store(k, 1.0 * weight_cn)
+                            else:
+                                work2.unsafe_store(k, iq * weight_cn)
+                            k += 1
+                    else:
+                        # `weights = np.ones(neighbours.shape, dtype=weight_dtype)`
+                        while k < cdeg:
+                            var nn = Int(iget(colind, clo + k))
+                            if nn == previous_node:
+                                work2.unsafe_store(k, ip)
+                            elif _contains(indices, deg, nn):
+                                work2.unsafe_store(k, 1.0)
+                            else:
+                                work2.unsafe_store(k, iq)
+                            k += 1
                     # `naive_weighted_choices` draws `rs.random()` internally,
                     # so the caller's advance is the second of the two steps
                     var choice = naive_weighted_choices(

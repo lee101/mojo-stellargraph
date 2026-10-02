@@ -26,11 +26,11 @@ _SIGNATURES: dict[str, tuple[list, object]] = {
     # stellargraph/core/utils.py
     "msg_normalize_adj": ([I, I, I, I, I], None),
     "msg_normalized_laplacian": ([I, I, I, I, I], None),
+    "msg_calculate_laplacian": ([I, I, I, I], None),
     "msg_rescale_laplacian": ([I, I, I, F], None),
     "msg_power_iteration": ([I, I, I, I, I, F], F),
-    "msg_chebyshev_polynomial": ([I, I, I, I, I], None),
     "msg_PPNP_Aadj_feats_op": ([I, I, I, I, I, I, F], I),
-    "msg_GCN_Aadj_feats_op": ([I, I, I, I, I, I, I, I, I], I),
+    "msg_GCN_Aadj_feats_op": ([I, I, I, I, I, I, I, I], I),
     "msg_invert": ([I, I, I, I], I),
     # stellargraph/mapper/node_mappers.py
     "msg_self_loops": ([I, I, I], None),
@@ -86,10 +86,13 @@ _SIGNATURES: dict[str, tuple[list, object]] = {
     # stellargraph/data/explorer.py
     "msg_naive_weighted_choices": ([I, I, I, I, I, U], I),
     "msg_uniform_random_walk": ([I, I, I, I, I, I, I, I, I, I], None),
-    "msg_biased_random_walk": ([I, I, I, I, I, I, I, I, I, I, I, F, F, I], None),
+    "msg_biased_random_walk": (
+        [I, I, I, I, I, I, I, I, I, I, I, I, F, F, I, I],
+        None,
+    ),
     # sparse helpers behind the two upstream TensorFlow sparse ops
     "msg_coo_to_csr": ([I, I, I, I, I, I, I, I, I, I], I),
-    "msg_sparse_dense_matmul": ([I, I, I, I, I, I, I, I], None),
+    "msg_sparse_dense_matmul": ([I, I, I, I, I, I, I, I], I),
 }
 
 

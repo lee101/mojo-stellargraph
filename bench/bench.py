@@ -50,6 +50,59 @@ def timeit(fn, repeat: int = 3, budget: float = 1.0) -> float:
     return best
 
 
+def check(ours, theirs, name, rtol=1e-6, atol=1e-9):
+    """Compare one case's outputs against the reference before timing it.
+
+    A benchmark only reports how fast a kernel is; nothing in it says the kernel
+    was right. This compares each case's result to the reference on a subsample,
+    so a timing table can never be produced from a wrong kernel."""
+    _compare(ours(), theirs(), name, rtol, atol)
+
+
+def _compare(a, b, name, rtol, atol):
+    """`a` and `b` are already-evaluated outputs, not callables.
+
+    `GCN_Aadj_feats_op` returns upstream's `(features, A)` pair whose two blocks
+    have unrelated shapes, and `features` is the caller's array passed straight
+    through, which the benchmark hands in as `None`. Both are handled here so
+    every case in the table is compared, not skipped."""
+    if a is None or b is None:
+        if a is not b:
+            raise AssertionError(
+                "{}: {} against reference {}".format(name, a, b)
+            )
+        return
+    if isinstance(a, (tuple, list)) or isinstance(b, (tuple, list)):
+        a, b = list(a), list(b)
+        if len(a) != len(b):
+            raise AssertionError(
+                "{}: {} blocks against reference {}".format(name, len(a), len(b))
+            )
+        for p, (x, y) in enumerate(zip(a, b)):
+            _compare(x, y, "{} block {}".format(name, p), rtol, atol)
+        return
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        raise AssertionError(
+            "{}: shape {} != reference {}".format(name, a.shape, b.shape)
+        )
+    if a.size > 20000:  # subsample, so the check costs no more than the timing
+        step = max(1, a.shape[0] // 512)
+        a, b = a[::step], b[::step]
+    if a.size == 0:
+        return
+    if not np.issubdtype(a.dtype, np.number) or not np.issubdtype(b.dtype, np.number):
+        return  # a case whose output carries no numbers (the walks)
+    scale = max(1.0, float(np.abs(b).max()))
+    diff = float(np.abs(a - b).max())
+    if not np.isfinite(diff) or diff > atol + rtol * scale:
+        raise AssertionError(
+            "{}: maxdiff {:.3e} exceeds {:.3e} (reference scale {:.3e})".format(
+                name, diff, atol + rtol * scale, scale
+            )
+        )
+
+
 def graph(n: int, d: int, seed: int = 0, density: float = 0.02, loops: bool = True):
     rng = np.random.default_rng(seed)
     a = (rng.random((n, n)) < density).astype(np.float64)
@@ -115,21 +168,21 @@ def _():
     )
 
 
-@case("chebyshev_polynomial k=4 (400 x 400)")
-def _():
-    a, _x = graph(400, 1)
-    return (
-        lambda: sg.chebyshev_polynomial(a, 4),
-        lambda: ref._chebyshev_polynomial(a, 4),
-    )
-
-
 @case("invert (700 x 700)")
 def _():
     rng = np.random.default_rng(1)
     m = rng.normal(size=(700, 700))
     m = m @ m.T + 700 * np.eye(700)
     return (lambda: sg.invert(m), lambda: np.linalg.inv(m))
+
+
+@case("calculate_laplacian (1500 x 1500)")
+def _():
+    a, _x = graph(1500, 1)
+    return (
+        lambda: sg.calculate_laplacian(a),
+        lambda: ref._calculate_laplacian(a),
+    )
 
 
 @case("GraphPreProcessingLayer (1200 x 1200)")
@@ -415,11 +468,11 @@ def _():
     rows = np.repeat(np.arange(n), deg)
     cols = rng.integers(0, n, size=rows.size)
     edges = np.stack([rows, cols], axis=1)
-    walker = sg.UniformRandomWalk(edges, n)
+    walker = sg.UniformRandomWalk(edges, n=4, length=10)
     indptr, colind = sg.csr_from_edges(edges, n)
     roots = np.arange(0, n, 8)
     return (
-        lambda: walker.run(roots, 4, 10, 42),
+        lambda: walker.run(roots, seed=42),
         lambda: ref.uniform_random_walk(indptr, colind, roots, 4, 10, 42),
     )
 
@@ -432,11 +485,11 @@ def _():
     rows = np.repeat(np.arange(n), deg)
     cols = rng.integers(0, n, size=rows.size)
     edges = np.stack([rows, cols], axis=1)
-    walker = sg.BiasedRandomWalk(edges, n)
+    walker = sg.BiasedRandomWalk(edges, n=2, p=0.5, q=2.0, length=10)
     indptr, colind = sg.csr_from_edges(edges, n)
     roots = np.arange(0, n, 2)
     return (
-        lambda: walker.run(roots, 2, p=0.5, q=2.0, length=10, seed=42),
+        lambda: walker.run(roots, seed=42),
         lambda: ref.biased_random_walk(indptr, colind, roots, 2, 0.5, 2.0, 10, 42),
     )
 
@@ -459,12 +512,14 @@ def machine() -> str:
 def main() -> int:
     print("mojo-stellargraph benchmark")
     print("baseline: tests/upstream_reference.py (NumPy transliteration of")
-    print("          stellargraph v0.8.1; the real package needs Python < 3.9)")
+    print("          stellargraph 1.2.1)")
     print("machine:  {}".format(machine()))
-    print()
+    print(flush=True)
     rows = []
     for name, build in CASES:
+        print("  running: {}".format(name), flush=True)
         ours, theirs = build()
+        check(ours, theirs, name)
         t_ours = timeit(ours)
         t_theirs = timeit(theirs)
         rows.append((name, t_ours, t_theirs))

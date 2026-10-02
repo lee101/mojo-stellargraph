@@ -51,9 +51,11 @@ def code(activation) -> int:
         ) from None
 
 
-#: `keras.layers.LeakyReLU`'s default negative slope, which is the `alpha`
-#: every layer passes when upstream writes `LeakyReLU(alpha=0.2)` nowhere.
-LEAKY_RELU_ALPHA = 0.01
+#: `tf.keras.activations.get("leaky_relu")` resolves to
+#: `tf.nn.leaky_relu(x, alpha=0.2)` in the Keras 2 that `stellargraph` 1.2.1
+#: requires. This is NOT Keras 1's documented default of 0.3; it was measured
+#: against the installed package (see `tests/test_upstream_parity.py`).
+LEAKY_RELU_ALPHA = 0.2
 
 
 def alpha(activation) -> float:
@@ -79,7 +81,7 @@ def numpy_activation(activation):
     if activation == "softplus":
         return lambda x: np.log1p(np.exp(x))
     if activation == "leaky_relu":
-        return lambda x: np.where(x >= 0, x, 0.01 * x)
+        return lambda x: np.where(x >= 0, x, LEAKY_RELU_ALPHA * x)
     if activation == "hard_sigmoid":
         return lambda x: np.clip(0.2 * x + 0.5, 0.0, 1.0)
     if activation == "softsign":

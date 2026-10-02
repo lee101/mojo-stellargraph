@@ -10,6 +10,7 @@ Everything is float64. Upstream builds its adjacency as `float32`
 divergence, and it is the only dtype the tests compare exactly.
 """
 
+from max.algorithm import parallelize
 from std.math import exp, log, sqrt, tanh
 from std.sys import simd_width_of
 
@@ -17,6 +18,116 @@ comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int32, AnyOrigin[mut=True]]
 comptime W = simd_width_of[DType.float64]()
 comptime Vec = SIMD[DType.float64, W]
+
+# Row blocks per work item, and the product size at which `_dot_axpy` spreads
+# its blocks over workers. 8 * 8 * 1e6 = 6.4e7: below that the measured
+# `parallelize` launch (about 4 ms here) is longer than the serial loop it
+# replaces, so the threshold sits above every shape a small caller passes.
+comptime DOT_BLOCK = 8
+comptime DOT_PAR_THRESHOLD = 16000000
+comptime DOT_WORKERS = 16
+
+
+def _dot_axpy_parallel(a: FPtr, b: FPtr, dst: FPtr, n: Int, k: Int, m: Int):
+    """`_dot_axpy` with its row blocks handed to `parallelize`.
+
+    Each work item owns a disjoint run of complete four-row blocks, so no two
+    workers write the same `dst` row and no reduction is needed. The odd
+    trailing rows and the four-row tail of each item go through the same
+    block routine the serial path uses, which keeps the arithmetic identical.
+    """
+    var blocks = n // 4
+    var items = (blocks + DOT_BLOCK - 1) // DOT_BLOCK
+
+    def work(item: Int) {imm}:
+        var lo = item * DOT_BLOCK
+        var hi = lo + DOT_BLOCK
+        if hi > blocks:
+            hi = blocks
+        var b4 = lo * 4
+        while b4 < hi * 4:
+            _dot_axpy_block(a, b, dst, b4, k, m)
+            b4 += 4
+
+    parallelize(work, items, DOT_WORKERS)
+
+    var i = blocks * 4
+    while i < n:
+        _dot_axpy_row(a, b, dst, i, k, m)
+        i += 1
+
+
+def _dot_axpy_block(a: FPtr, b: FPtr, dst: FPtr, i: Int, k: Int, m: Int):
+    """The four-row body of `_dot_axpy`, at rows `i .. i + 3`."""
+    var a0 = a.unsafe_offset(i * k)
+    var a1 = a0.unsafe_offset(k)
+    var a2 = a1.unsafe_offset(k)
+    var a3 = a2.unsafe_offset(k)
+    var d0 = dst.unsafe_offset(i * m)
+    var d1 = d0.unsafe_offset(m)
+    var d2 = d1.unsafe_offset(m)
+    var d3 = d2.unsafe_offset(m)
+    var zero = Vec(0.0)
+    var j = 0
+    while j + W <= m:
+        d0.unsafe_store(j, zero)
+        d1.unsafe_store(j, zero)
+        d2.unsafe_store(j, zero)
+        d3.unsafe_store(j, zero)
+        j += W
+    while j < m:
+        d0.unsafe_store(j, 0.0)
+        d1.unsafe_store(j, 0.0)
+        d2.unsafe_store(j, 0.0)
+        d3.unsafe_store(j, 0.0)
+        j += 1
+    var t = 0
+    while t < k:
+        var x0 = a0.unsafe_load(t)
+        var x1 = a1.unsafe_load(t)
+        var x2 = a2.unsafe_load(t)
+        var x3 = a3.unsafe_load(t)
+        j = 0
+        while j + W <= m:
+            var bv = b.unsafe_load[width=W](t * m + j)
+            d0.unsafe_store(j, d0.unsafe_load[width=W](j) + bv * x0)
+            d1.unsafe_store(j, d1.unsafe_load[width=W](j) + bv * x1)
+            d2.unsafe_store(j, d2.unsafe_load[width=W](j) + bv * x2)
+            d3.unsafe_store(j, d3.unsafe_load[width=W](j) + bv * x3)
+            j += W
+        while j < m:
+            var bv = b.unsafe_load(t * m + j)
+            d0.unsafe_store(j, d0.unsafe_load(j) + bv * x0)
+            d1.unsafe_store(j, d1.unsafe_load(j) + bv * x1)
+            d2.unsafe_store(j, d2.unsafe_load(j) + bv * x2)
+            d3.unsafe_store(j, d3.unsafe_load(j) + bv * x3)
+            j += 1
+        t += 1
+
+
+def _dot_axpy_row(a: FPtr, b: FPtr, dst: FPtr, i: Int, k: Int, m: Int):
+    """`_dot_axpy` for the single row left over by its four-row blocking."""
+    var arow = a.unsafe_offset(i * k)
+    var drow = dst.unsafe_offset(i * m)
+    var zero = Vec(0.0)
+    var j = 0
+    while j + W <= m:
+        drow.unsafe_store(j, zero)
+        j += W
+    while j < m:
+        drow.unsafe_store(j, 0.0)
+        j += 1
+    var t = 0
+    while t < k:
+        var av = arow.unsafe_load(t)
+        j = 0
+        while j + W <= m:
+            drow.unsafe_store(j, drow.unsafe_load[width=W](j) + av * b.unsafe_load[width=W](t * m + j))
+            j += W
+        while j < m:
+            drow.unsafe_store(j, drow.unsafe_load(j) + av * b.unsafe_load(t * m + j))
+            j += 1
+        t += 1
 
 # Upstream holds activations as Keras objects (`activations.get("relu")`).
 # A C ABI call cannot take one, so the Python side maps the upstream string to
@@ -173,73 +284,26 @@ def _dot_row(arow: FPtr, b: FPtr, drow: FPtr, k: Int, m: Int):
 
 def _dot_axpy(a: FPtr, b: FPtr, dst: FPtr, n: Int, k: Int, m: Int):
     """`dot` as four rank-1 updates at a time: one streaming pass over `b`
-    per block of four rows of `a`, accumulating in `dst`."""
+    per block of four rows of `a`, accumulating in `dst`.
+
+    Above `DOT_PAR_THRESHOLD` flops the blocks of rows are spread over
+    workers instead of walked one after another. `b` is streamed once per
+    block of four rows in both forms, so each worker streams its own copy of
+    it; the product is large enough by then for the shared read to be the
+    smaller cost. Below the threshold the launch costs more than the loop it
+    replaces -- measured at roughly 4 ms per launch on this host -- so the
+    serial path stays and every small `dot` a caller makes pays nothing.
+    """
+    if n * k * m >= DOT_PAR_THRESHOLD:
+        _dot_axpy_parallel(a, b, dst, n, k, m)
+        return
+
     var i = 0
     while i + 4 <= n:
-        var a0 = a.unsafe_offset(i * k)
-        var a1 = a0.unsafe_offset(k)
-        var a2 = a1.unsafe_offset(k)
-        var a3 = a2.unsafe_offset(k)
-        var d0 = dst.unsafe_offset(i * m)
-        var d1 = d0.unsafe_offset(m)
-        var d2 = d1.unsafe_offset(m)
-        var d3 = d2.unsafe_offset(m)
-        var zero = Vec(0.0)
-        var j = 0
-        while j + W <= m:
-            d0.unsafe_store(j, zero)
-            d1.unsafe_store(j, zero)
-            d2.unsafe_store(j, zero)
-            d3.unsafe_store(j, zero)
-            j += W
-        while j < m:
-            d0.unsafe_store(j, 0.0)
-            d1.unsafe_store(j, 0.0)
-            d2.unsafe_store(j, 0.0)
-            d3.unsafe_store(j, 0.0)
-            j += 1
-        var t = 0
-        while t < k:
-            var x0 = a0.unsafe_load(t)
-            var x1 = a1.unsafe_load(t)
-            var x2 = a2.unsafe_load(t)
-            var x3 = a3.unsafe_load(t)
-            j = 0
-            while j + W <= m:
-                var bv = b.unsafe_load[width=W](t * m + j)
-                d0.unsafe_store(j, d0.unsafe_load[width=W](j) + bv * x0)
-                d1.unsafe_store(j, d1.unsafe_load[width=W](j) + bv * x1)
-                d2.unsafe_store(j, d2.unsafe_load[width=W](j) + bv * x2)
-                d3.unsafe_store(j, d3.unsafe_load[width=W](j) + bv * x3)
-                j += W
-            while j < m:
-                var bv = b.unsafe_load(t * m + j)
-                d0.unsafe_store(j, d0.unsafe_load(j) + bv * x0)
-                d1.unsafe_store(j, d1.unsafe_load(j) + bv * x1)
-                d2.unsafe_store(j, d2.unsafe_load(j) + bv * x2)
-                d3.unsafe_store(j, d3.unsafe_load(j) + bv * x3)
-                j += 1
-            t += 1
+        _dot_axpy_block(a, b, dst, i, k, m)
         i += 4
     while i < n:
-        var arow = a.unsafe_offset(i * k)
-        var drow = dst.unsafe_offset(i * m)
-        var zero = Vec(0.0)
-        var j = 0
-        while j + W <= m:
-            drow.unsafe_store(j, zero)
-            j += W
-        while j < m:
-            drow.unsafe_store(j, 0.0)
-            j += 1
-        var t = 0
-        while t < k:
-            var av = arow.unsafe_load(t)
-            j = 0
-            while j < m:
-                drow.unsafe_store(j, drow.unsafe_load(j) + av * b.unsafe_load(t * m + j))
-                j += 1
-            t += 1
+        _dot_axpy_row(a, b, dst, i, k, m)
         i += 1
 
 

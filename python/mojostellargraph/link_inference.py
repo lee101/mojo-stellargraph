@@ -125,6 +125,15 @@ def link_inference(
             )
         )
     bias = np.zeros(output_dim) if bias is None else f64(bias).reshape(-1)
+    if needs_dense and bias.size != output_dim:
+        # The kernel adds `bias[j]` for every `j` in `[0, output_dim)`, so a
+        # bias of the wrong length is an out-of-bounds read of the caller's
+        # buffer rather than a wrong number. Keras's `Dense` would never have
+        # built the layer, so the check belongs here. `ip`/`dot` has no `Dense`
+        # and returns before the bias is touched, so nothing is read there.
+        raise ValueError(
+            "bias must have shape (output_dim={}), got {}".format(output_dim, bias.shape)
+        )
     kernel_rows = int(kernel.shape[0])
     kernel = np.ascontiguousarray(kernel).reshape(-1)
     clip = 1 if clip_limits is not None else 0

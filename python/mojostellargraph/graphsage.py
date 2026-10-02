@@ -384,19 +384,27 @@ class GraphSAGE:
             for layer, pairs in enumerate(group_dims):
                 row = []
                 for i, (d_self, d_neigh) in enumerate(pairs):
-                    row.append(self._build_layer(layer, d_self, d_neigh))
+                    row.append(self._build_layer(layer, [d_self, d_neigh]))
                 self._aggs.append(row)
         return self
 
-    def _build_layer(self, layer, d_self, d_neigh):
-        """The aggregator list for one `(layer, head)` pair."""
+    def _build_layer(self, layer, in_dims):
+        """The aggregator list for one `(layer, head)` pair.
+
+        `in_dims[g]` is the feature width of input group `g`: group 0 is the
+        head node's own features, the rest are the neighbour groups the
+        aggregator concatenates. `DirectedGraphSAGE` passes three of them,
+        `[parent, in_child, out_child]`, exactly as upstream's
+        `aggregate_neighbours` does.
+        """
         out_dim = self.layer_sizes[layer]
+        in_dims = [int(d) for d in in_dims]
         if issubclass(self.aggregator, AttentionalAggregator):
             # upstream's `calculate_group_sizes` gives the head node group no
             # weight of its own: `weight_dims[0] = 0`
-            dims = [(1, int(d_neigh))]
+            dims = list(enumerate(in_dims))[1:]
         else:
-            dims = [(0, int(d_self)), (1, int(d_neigh))]
+            dims = list(enumerate(in_dims))
         # `compute_output_shape` returns `self.output_dim`, so `output_dim` is
         # split across the groups, with the remainder on the first.
         num_groups = len(dims)
@@ -414,13 +422,14 @@ class GraphSAGE:
             aggs.append(agg)
         return aggs
 
-    def _ensure(self, layer, i, d_self, d_neigh):
+    def _ensure(self, layer, i, in_dims):
         while len(self._aggs) <= layer:
             self._aggs.append([])
         row = self._aggs[layer]
         if i >= len(row):
-            row.append(self._build_layer(layer, d_self, d_neigh))
+            row.append(self._build_layer(layer, in_dims))
         return row[i]
+
 
     def __call__(self, xin):
         """
@@ -451,10 +460,10 @@ class GraphSAGE:
                 # The head-node group is contracted over the feature axis
                 # only, so its input width is everything below `n_head`.
                 aggs = self._ensure(
-                    layer, i, int(np.prod(h_layer[i].shape[2:])),
-                    h_layer[i + 1].shape[-1],
+                    layer, i,
+                    [int(np.prod(h_layer[i].shape[2:])), h_layer[i + 1].shape[-1]],
                 )
-                layer_out.append(self._apply_aggregator(aggs, h_layer[i], neigh_in))
+                layer_out.append(self._apply_aggregator(aggs, h_layer[i], [neigh_in]))
             h_layer = layer_out
 
         outs = []
@@ -467,23 +476,26 @@ class GraphSAGE:
             outs.append(self._normalization(x))
         return outs[0] if len(outs) == 1 else outs
 
-    def _apply_aggregator(self, aggs, x_self, neigh_in):
+    def _apply_aggregator(self, aggs, x_self, groups):
         """One pass of upstream's `apply_layer` inner loop: the head node's own
         features and its sampled neighbours go into the layer's aggregator.
+
+        `groups` is the list of neighbour groups the aggregator concatenates,
+        one per hop for `GraphSAGE` and `[in_child, out_child]` for
+        `DirectedGraphSAGE`.
 
         Upstream's group 0 is `K.dot(x[i], w)`, which contracts the feature axis
         and drops one rank. Here the self group is contracted over everything
         below `n_head`, which is the same operation when that axis has size one
         -- the case for head 0, where `neighbourhood_sizes[0] == 1`. See the
         README for the divergence on the other heads."""
-        b, h = x_self.shape[0], x_self.shape[1]
         if isinstance(aggs[0], AttentionalAggregator):
-            return aggs[0].call(x_self, neigh_in[None, ...])
+            return aggs[0].call(x_self, np.stack(groups))
         # the head group is contracted over everything below `n_head` at once;
         # `_build_layer` sized `w` with that same product
         parts = [aggs[0].group_aggregate(x_self, 0)]
         parts += [
-            agg.group_aggregate(neigh_in, g) for g, agg in enumerate(aggs[1:], 1)
+            agg.group_aggregate(groups[g - 1], g) for g, agg in enumerate(aggs[1:], 1)
         ]
         return aggs[0].call(np.concatenate(parts, axis=2))
 

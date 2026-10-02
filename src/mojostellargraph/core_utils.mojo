@@ -1,14 +1,18 @@
-"""Port of `stellargraph/core/utils.py` (v0.8.1).
+"""Port of `stellargraph/core/utils.py` (upstream 1.2.1).
 
 This is the GCN-ing / normalisation module: the sparse-matrix transformations
-upstream applies to an adjacency before it reaches a GCN, SGC, Chebyshev or
-PPNP model. Upstream is SciPy; here the same arithmetic runs over a dense
-row-major `[n, n]` float64 block, because that is the layout the C ABI can
-carry without a copy.
+upstream applies to an adjacency before it reaches a GCN, SGC or PPNP model.
+Upstream is SciPy; here the same arithmetic runs over a dense row-major
+`[n, n]` float64 block, because that is the layout the C ABI can carry without
+a copy.
 
 Upstream signatures are kept. `symmetric=True` becomes an `Int` flag because a
 C ABI call cannot carry a Python `bool` alongside the buffers; the branch
 itself is unchanged.
+
+`chebyshev_polynomial` and `GCN_Aadj_feats_op(method="chebyshev")` existed in
+v0.8.1 but were removed upstream in 1.2.1, which raises `ValueError` for that
+method, so neither is ported.
 
 `rescale_laplacian` is the one function whose numerics diverge: upstream calls
 `scipy.sparse.linalg.eigsh(laplacian, 1, which="LM")` and falls back to
@@ -23,9 +27,14 @@ from mojostellargraph.types import FPtr, Vec, W, dot
 # Upstream dispatches on the `method` string; the C ABI carries a code and
 # python/mojostellargraph/core_utils.py maps the string onto it.
 comptime METHOD_GCN = 0
-comptime METHOD_CHEBYSHEV = 1
 comptime METHOD_SGC = 2
 comptime METHOD_NONE = 3
+
+# Columns of a row are gathered `TB` at a time wherever the kernel reads
+# `adj[j, i]`: one column is `W` separate cache lines, so a block of `TB`
+# is `TB * W` lines and only `W` of them are touched per step. A scalar
+# walk down one column at a time misses on every element.
+comptime TB = 32
 
 
 def symmetrize(adj: FPtr, dst: FPtr, n: Int):
@@ -35,27 +44,69 @@ def symmetrize(adj: FPtr, dst: FPtr, n: Int):
     times: in `PPNP_Aadj_feats_op`, in `GCN_Aadj_feats_op` and in
     `GraphPreProcessingLayer.call`. It keeps `max(A, A.T)` in every position
     and is symmetric by construction, so no explicit transpose is needed.
+
+    Rows are held `W` at a time: `adj[i, j]` is then a contiguous vector load
+    and `adj[j, i]` a strided gather, so the per-element `keep` upstream needs
+    becomes a free `max`.
     """
-    for i in range(n):
-        for j in range(n):
-            var a = adj.unsafe_load(i * n + j)
-            var t = adj.unsafe_load(j * n + i)
-            var keep = 1.0 if t > a else 0.0
-            dst.unsafe_store(i * n + j, a + t * keep - a * keep)
+    var i = 0
+    while i + W <= n:
+        _symmetrize_block[W](adj, dst, i, n)
+        i += W
+    while i < n:
+        _symmetrize_block[1](adj, dst, i, n)
+        i += 1
+
+
+def _symmetrize_block[rows: Int](adj: FPtr, dst: FPtr, i0: Int, n: Int):
+    """`symmetrize` for the `rows` rows starting at row `i0`, held at once.
+
+    `rows` is a compile-time width so the `adj[i, j]` side is a vector load
+    and the `adj[j, i]` side a gather, which is what turns the per-element
+    `keep` upstream needs into a free `max`.
+    """
+    var r = 0
+    while r < rows:
+        var arow = adj.unsafe_offset((i0 + r) * n)
+        var drow = dst.unsafe_offset((i0 + r) * n)
+        # dst[i0 + r, j] = max(adj[i0 + r, j], adj[j, i0 + r]) for every j
+        var j = 0
+        while j + rows <= n:
+            var tv = SIMD[DType.float64, rows]()
+            var t = 0
+            while t < rows:
+                tv[t] = adj.unsafe_load((j + t) * n + i0 + r)
+                t += 1
+            drow.unsafe_store(j, max(arow.unsafe_load[width=rows](j), tv))
+            j += rows
+        while j < n:
+            drow.unsafe_store(j, max(arow.unsafe_load(j), adj.unsafe_load(j * n + i0 + r)))
+            j += 1
+        r += 1
 
 
 def add_self_loops(adj: FPtr, dst: FPtr, n: Int):
     """`adj + sp.diags(np.ones(n) - adj.diagonal())`.
 
     Upstream spells this out in three places; the arithmetic is the same and is
-    factored out here.
+    factored out here. Only the `n` diagonal entries change, so each row is a
+    copy and the diagonal is overwritten rather than a conditional add per
+    element.
     """
     for i in range(n):
-        for j in range(n):
-            var v = adj.unsafe_load(i * n + j)
-            if i == j:
-                v += 1.0 - v
-            dst.unsafe_store(i * n + j, v)
+        var arow = adj.unsafe_offset(i * n)
+        var drow = dst.unsafe_offset(i * n)
+        var j = 0
+        while j + W <= n:
+            drow.unsafe_store(j, arow.unsafe_load[width=W](j))
+            j += W
+        while j < n:
+            drow.unsafe_store(j, arow.unsafe_load(j))
+            j += 1
+    var j = 0
+    while j < n:
+        dst.unsafe_store(j * n + j, 1.0)
+        j += 1
 
 
 
@@ -71,7 +122,28 @@ def _inv(x: Float64) -> Float64:
     return 1.0 / x if x > 0.0 else 0.0
 
 
-def normalize_adj(adj: FPtr, dst: FPtr, d: FPtr, n: Int, symmetric: Int):
+def _sub_identity(dst: FPtr, n: Int):
+    """`I - dst`, in place: `normalized_laplacian`'s `1 - A_norm`.
+
+    Every entry is negated and the diagonal gets `+1`. It is stepped one
+    element at a time because the `n` diagonal entries are `n` doubles apart,
+    and a `W`-wide store at `k * n + k` would run on into the next row.
+    """
+    var i = 0
+    while i < n:
+        var drow = dst.unsafe_offset(i * n)
+        var j = 0
+        while j + W <= n:
+            drow.unsafe_store(j, drow.unsafe_load[width=W](j) * Vec(-1.0))
+            j += W
+        while j < n:
+            drow.unsafe_store(j, -drow.unsafe_load(j))
+            j += 1
+        dst.unsafe_store(i * n + i, dst.unsafe_load(i * n + i) + 1.0)
+        i += 1
+
+
+def normalize_adj(adj: FPtr, dst: FPtr, d: FPtr, n: Int, symmetric: Int, sub_identity: Int = 0):
     """Upstream `normalize_adj(adj, symmetric=True)`.
 
     ```
@@ -85,44 +157,156 @@ def normalize_adj(adj: FPtr, dst: FPtr, d: FPtr, n: Int, symmetric: Int):
 
     `adj.sum(1)` is the row sum. The left diagonal scales rows and the right
     one columns, and the transpose in the symmetric branch swaps them, so
-    `a_norm[i, j] = adj[j, i] / d[i] / d[j]`. `d` is `n` scratch.
+    `a_norm[i, j] = adj[j, i] / d[i] / d[j]`. `d` is `n` scratch and is
+    overwritten with the per-node scale once the sums are in it.
+
+    `sub_identity` subtracts the identity on the way out, which is
+    `normalized_laplacian`'s `I - A_norm` folded into the same pass.
     """
     for i in range(n):
-        var s = 0.0
-        for j in range(n):
-            s += adj.unsafe_load(i * n + j)
-        d.unsafe_store(i, s)
+        var s = Vec(0.0)
+        var j = 0
+        while j + W <= n:
+            s += adj.unsafe_load[width=W](i * n + j)
+            j += W
+        # `s` is a W-wide register, so the tail goes into its own scalar sum:
+        # adding a `Float64` to a `SIMD` broadcasts it and counts it W times.
+        var tail = s.reduce_add()
+        while j < n:
+            tail += adj.unsafe_load(i * n + j)
+            j += 1
+        d.unsafe_store(i, tail)
     if symmetric:
+        # `d ** -0.5`, one square root per node rather than one per element.
         for i in range(n):
-            var di = _inv_sqrt(d.unsafe_load(i))
-            for j in range(n):
-                dst.unsafe_store(
-                    i * n + j,
-                    adj.unsafe_load(j * n + i) * di * _inv_sqrt(d.unsafe_load(j)),
-                )
+            d.unsafe_store(i, _inv_sqrt(d.unsafe_load(i)))
+        # a_norm[i, j] = adj[j, i] * d[i] * d[j], with `1 - a_norm` folded in
+        var jb = 0
+        while jb + TB <= n:
+            _normalize_block[TB](adj, dst, d, jb, n, sub_identity)
+            jb += TB
+        var rest = n - jb
+        if rest > 0:
+            _normalize_tail(adj, dst, d, jb, rest, n, sub_identity)
     else:
         for i in range(n):
-            var di = _inv(d.unsafe_load(i))
-            for j in range(n):
-                dst.unsafe_store(i * n + j, di * adj.unsafe_load(i * n + j))
+            d.unsafe_store(i, _inv(d.unsafe_load(i)))
+        for i in range(n):
+            var arow = adj.unsafe_offset(i * n)
+            var drow = dst.unsafe_offset(i * n)
+            var di = Vec(d.unsafe_load(i))
+            var j = 0
+            while j + W <= n:
+                drow.unsafe_store(j, arow.unsafe_load[width=W](j) * di)
+                j += W
+            while j < n:
+                drow.unsafe_store(j, arow.unsafe_load(j) * d.unsafe_load(i))
+                j += 1
+        if sub_identity:
+            _sub_identity(dst, n)
+
+
+def _normalize_block[cols: Int](
+    adj: FPtr, dst: FPtr, d: FPtr, jb: Int, n: Int, sub_identity: Int
+):
+    """One `cols`-wide column block of `normalize_adj`'s symmetric branch.
+
+    `dst[i, jb + j] = adj[jb + j, i] * d[i] * d[jb + j]` for `j` in `[0, cols)`,
+    with `d` already holding the `** -0.5` scales. `sub_identity` negates the
+    result and puts `1` on the diagonal, which is `normalized_laplacian`'s
+    `I - A_norm`; doing it here saves the second read and write of `n * n`
+    doubles that a separate pass would cost.
+
+    The transposed read `adj[jb + j, i]` is a gather with stride `n`, so there
+    is nothing contiguous to widen: what this buys over a plain double loop is
+    the precomputed scale vector and the absent per-element `sqrt`.
+    """
+    var i = 0
+    while i < n:
+        var drow = dst.unsafe_offset(i * n + jb)
+        var di = d.unsafe_load(i)
+        var j = 0
+        while j < cols:
+            var v = adj.unsafe_load((jb + j) * n + i) * di * d.unsafe_load(jb + j)
+            if sub_identity:
+                v = -v
+                if i == jb + j:
+                    v += 1.0
+            drow.unsafe_store(j, v)
+            j += 1
+        i += 1
+
+
+def _normalize_tail(
+    adj: FPtr, dst: FPtr, d: FPtr, jb: Int, rest: Int, n: Int, sub_identity: Int
+):
+    """The fewer-than-TB columns at the right edge."""
+    var i = 0
+    while i < n:
+        var drow = dst.unsafe_offset(i * n + jb)
+        var di = d.unsafe_load(i)
+        var j = 0
+        while j < rest:
+            var v = adj.unsafe_load((jb + j) * n + i) * di * d.unsafe_load(jb + j)
+            if sub_identity:
+                v = -v
+                if i == jb + j:
+                    v += 1.0
+            drow.unsafe_store(j, v)
+            j += 1
+        i += 1
 
 
 def normalized_laplacian(adj: FPtr, laplacian: FPtr, d: FPtr, n: Int, symmetric: Int):
-    """Upstream `normalized_laplacian(adj, symmetric=True)`: `I - A_norm`."""
-    normalize_adj(adj, laplacian, d, n, symmetric)
+    """Upstream `normalized_laplacian(adj, symmetric=True)`: `I - A_norm`.
+
+    The `1 - A_norm` is fused into `normalize_adj`'s output rather than run as a
+    second pass over the whole block: `A_norm` is not read anywhere else, so
+    storing it and reading it back is `n * n` doubles of traffic for nothing.
+    """
+    normalize_adj(adj, laplacian, d, n, symmetric, 1)
+
+
+def calculate_laplacian(adj: FPtr, dst: FPtr, d: FPtr, n: Int):
+    """Upstream `calculate_laplacian(adj)`.
+
+    ```
+    D = np.diag(np.ravel(adj.sum(axis=0)) ** (-0.5))
+    adj = np.dot(D, np.dot(adj, D))
+    ```
+
+    The degree is the COLUMN sum here (`sum(axis=0)`), where
+    `normalize_adj` uses the row sum (`sum(1)`). The two differ for a
+    non-symmetric adjacency, which is why this is a separate function upstream
+    and not a call to `normalize_adj`.
+    """
+    # `adj.sum(axis=0)` is the column sum. Summing `W` columns into one register
+    # and reducing it would add the columns together, not accumulate each
+    # column down its rows, so the column sums stay a scalar walk: `adj[i, j]`
+    # for consecutive `i` strides by `n`. The `** -0.5` and the scaling pass
+    # below are what this kernel spends its time on, and both vectorize.
+    for j in range(n):
+        var t = 0.0
+        var r = 0
+        while r < n:
+            t += adj.unsafe_load(r * n + j)
+            r += 1
+        d.unsafe_store(j, t)
     for i in range(n):
-        for j in range(n):
-            laplacian.unsafe_store(
-                i * n + j,
-                (1.0 if i == j else 0.0) - laplacian.unsafe_load(i * n + j),
+        d.unsafe_store(i, _inv_sqrt(d.unsafe_load(i)))
+    for i in range(n):
+        var arow = adj.unsafe_offset(i * n)
+        var drow = dst.unsafe_offset(i * n)
+        var di = Vec(d.unsafe_load(i))
+        var j = 0
+        while j + W <= n:
+            drow.unsafe_store(
+                j, arow.unsafe_load[width=W](j) * d.unsafe_load[width=W](j) * di
             )
-
-
-def preprocess_adj(adj: FPtr, dst: FPtr, work: FPtr, d: FPtr, n: Int, symmetric: Int):
-    """The nested `preprocess_adj` in `GCN_Aadj_feats_op`: self loops first,
-    then normalization. `work` is the `n * n` intermediate."""
-    add_self_loops(adj, work, n)
-    normalize_adj(work, dst, d, n, symmetric)
+            j += W
+        while j < n:
+            drow.unsafe_store(j, arow.unsafe_load(j) * d.unsafe_load(j) * d.unsafe_load(i))
+            j += 1
 
 
 def rescale_laplacian(laplacian: FPtr, dst: FPtr, n: Int, largest_eigval: Float64):
@@ -136,11 +320,18 @@ def rescale_laplacian(laplacian: FPtr, dst: FPtr, n: Int, largest_eigval: Float6
     # and `power_iteration` reports failure as 0.0; both give a scale of 1.0
     var scale = 2.0 / largest_eigval if largest_eigval > 0.0 else 1.0
     for i in range(n):
-        for j in range(n):
-            var v = scale * laplacian.unsafe_load(i * n + j)
-            if i == j:
-                v -= 1.0
-            dst.unsafe_store(i * n + j, v)
+        var lrow = laplacian.unsafe_offset(i * n)
+        var drow = dst.unsafe_offset(i * n)
+        var j = 0
+        while j + W <= n:
+            drow.unsafe_store(j, lrow.unsafe_load[width=W](j) * Vec(scale))
+            j += W
+        while j < n:
+            drow.unsafe_store(j, lrow.unsafe_load(j) * scale)
+            j += 1
+        # the `I` of `(2 / lambda) * L - I` touches only this row's diagonal,
+        # so it is applied here rather than in a second pass over the block
+        drow.unsafe_store(i, drow.unsafe_load(i) - 1.0)
 
 
 def power_iteration(
@@ -175,58 +366,6 @@ def power_iteration(
         if diff < tol:
             break
     return eigval
-
-
-def chebyshev_polynomial(x: FPtr, result: FPtr, work: FPtr, n: Int, k: Int):
-    """Upstream `chebyshev_polynomial(X, k)`.
-
-    ```
-    T_k = [sp.eye(n), X]
-    def chebyshev_recurrence(T_k_minus_one, T_k_minus_two, X):
-        return 2 * X.copy().dot(T_k_minus_one) - T_k_minus_two
-    for i in range(2, k + 1):
-        T_k.append(chebyshev_recurrence(T_k[-1], T_k[-2], X))
-    ```
-
-    Upstream returns a list of sparse matrices; a C ABI call cannot, so the
-    polynomials land consecutively in `out` as `k + 1` blocks of `n * n` and
-    the Python side hands them back as a list of views. `work` is one `n * n`
-    block used for the `X_.dot(...)` product.
-    """
-    # `sp.eye(n)`, not a bare diagonal write: `result` is the caller's buffer.
-    var z = 0
-    while z < n * n:
-        result.unsafe_store(z, 0.0)
-        z += 1
-    for i in range(n):
-        result.unsafe_store(i * n + i, 1.0)
-    var j = 0
-    while j < n * n:
-        result.unsafe_store(n * n + j, x.unsafe_load(j))
-        j += 1
-
-    for step in range(2, k + 1):
-        var prev = (step - 2) * n * n
-        var cur = (step - 1) * n * n
-        var next = step * n * n
-        # `T_k = 2 * X.dot(T_k_minus_one) - T_k_minus_two`, as the shared
-        # `dot` and one more pass over the `[n, n]` block
-        dot(x, result.unsafe_offset(cur), work, n, n, n)
-        for r in range(n):
-            var wrow = work.unsafe_offset(r * n)
-            var prow = result.unsafe_offset(prev + r * n)
-            var nrow = result.unsafe_offset(next + r * n)
-            var j = 0
-            while j + W <= n:
-                nrow.unsafe_store(
-                    j,
-                    Vec(2.0) * wrow.unsafe_load[width=W](j)
-                    - prow.unsafe_load[width=W](j),
-                )
-                j += W
-            while j < n:
-                nrow.unsafe_store(j, 2.0 * wrow.unsafe_load(j) - prow.unsafe_load(j))
-                j += 1
 
 
 def invert(a: FPtr, dst: FPtr, work: FPtr, n: Int) -> Int:
@@ -341,9 +480,19 @@ def PPNP_Aadj_feats_op(
             tmp2.unsafe_store(i * n + j, v)
     if invert(tmp2, result, work, n) == 0:
         return 0
-    for i in range(n * n):
-        result.unsafe_store(i, teleport_probability * result.unsafe_load(i))
+    _scale_block(result, n * n, teleport_probability)
     return 1
+
+
+def _scale_block(x: FPtr, count: Int, f: Float64):
+    """`x[:count] *= f`, in place."""
+    var i = 0
+    while i + W <= count:
+        x.unsafe_store(i, x.unsafe_load[width=W](i) * Vec(f))
+        i += W
+    while i < count:
+        x.unsafe_store(i, x.unsafe_load(i) * f)
+        i += 1
 
 
 def GCN_Aadj_feats_op(
@@ -352,7 +501,6 @@ def GCN_Aadj_feats_op(
     work: FPtr,
     work2: FPtr,
     scratch: FPtr,
-    cheb_out: FPtr,
     n: Int,
     k: Int,
     method: Int,
@@ -362,53 +510,60 @@ def GCN_Aadj_feats_op(
     ```
     A = A + A.T.multiply(A.T > A) - A.multiply(A.T > A)
     if method == "gcn":       A = preprocess_adj(A)
-    elif method == "chebyshev": T_k = chebyshev_polynomial(rescale_laplacian(normalized_laplacian(A)), k)
+    elif method == "chebyshev": raise ValueError(...)
     elif method == "sgc":      A = preprocess_adj(A) ** k
     return features, A
     ```
 
-    `cheb_out` receives `k + 1` blocks of `n * n` for the Chebyshev case; the
-    Python side turns that into the `[features] + T_k` list upstream returns.
-    Returns 0 for an undefined method (upstream raises `ValueError`).
+    Upstream 1.2.1 removed the `chebyshev` branch outright, so there is no
+    `cheb_out` buffer here: the Python wrapper raises the same `ValueError`
+    before the call.
+
+    Returns 0 for an undefined method (upstream raises `ValueError`) or for a
+    non-positive `k` under `sgc`.
     """
-    symmetrize(adj, result, n)
+    symmetrize(adj, work, n)
 
     if method == METHOD_GCN:
-        preprocess_adj(result, work, work2, scratch, n, 1)
-        var i = 0
-        while i < n * n:
-            result.unsafe_store(i, work.unsafe_load(i))
-            i += 1
-        return 1
-
-    if method == METHOD_CHEBYSHEV:
-        if k < 2:
-            return 0
-        normalized_laplacian(result, work, scratch, n, 1)
-        rescale_laplacian(work, work2, n, power_iteration(work, scratch, work2, n, 100, 1e-10))
-        chebyshev_polynomial(work2, cheb_out, work, n, k)
+        # `preprocess_adj` is `normalize_adj(add_self_loops(A))`. `add_self_loops`
+        # leaves every off-diagonal entry alone and sets the diagonal to 1, so
+        # it runs directly into `work2`, and `normalize_adj` then writes the
+        # normalized adjacency straight into `result` -- no `n * n` copy back
+        # at the end, which is what the original ordering paid.
+        add_self_loops(work, work2, n)
+        normalize_adj(work2, result, scratch, n, 1)
         return 1
 
     if method == METHOD_SGC:
         if k <= 0:
             return 0
         # A = A ** k
-        preprocess_adj(result, work2, work, scratch, n, 1)
-        var i = 0
-        while i < n * n:
-            result.unsafe_store(i, work2.unsafe_load(i))
-            i += 1
+        add_self_loops(work, work2, n)
+        normalize_adj(work2, result, scratch, n, 1)
+        _copy_block(result, work2, n)
         var step = 1
         while step < k:
             dot(work2, result, work, n, n, n)
-            i = 0
-            while i < n * n:
-                result.unsafe_store(i, work.unsafe_load(i))
-                i += 1
+            _copy_block(work, result, n)
             step += 1
         return 1
 
     if method == METHOD_NONE:
+        _copy_block(work, result, n)
         return 1
 
     return 0
+
+
+def _copy_block(src: FPtr, dst: FPtr, n: Int):
+    """`dst[:] = src` over an `n * n` block, one row at a time."""
+    for i in range(n):
+        var srow = src.unsafe_offset(i * n)
+        var drow = dst.unsafe_offset(i * n)
+        var j = 0
+        while j + W <= n:
+            drow.unsafe_store(j, srow.unsafe_load[width=W](j))
+            j += W
+        while j < n:
+            drow.unsafe_store(j, srow.unsafe_load(j))
+            j += 1

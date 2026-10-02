@@ -73,9 +73,9 @@ def test_sparse_matmul_dense_handles_an_empty_matrix():
     np.testing.assert_array_equal(out, np.zeros((4, 2)))
 
 
-def test_sparse_matmul_dense_is_not_confused_by_duplicate_edges():
-    """The kernel reads the canonical form, so a repeated edge is summed once
-    into the CSR rather than being walked twice."""
+def test_sparse_matmul_dense_counts_a_repeated_edge_once_per_copy():
+    """A repeated `(row, col)` pair contributes once per stored copy, which is
+    what `tf.sparse.matmul` does with duplicate indices."""
     t = sg.SparseTensor(
         np.array([[0, 0], [0, 0], [1, 2]], dtype=np.int32),
         np.array([1.0, 2.0, 3.0]),
@@ -83,7 +83,7 @@ def test_sparse_matmul_dense_is_not_confused_by_duplicate_edges():
     )
     dense = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
     np.testing.assert_allclose(
-        sg.sparse_matmul_dense(t, dense), np.array([[3.0, 3.0], [3.0, 3.0]]), atol=0.0
+        sg.sparse_matmul_dense(t, dense), np.array([[3.0, 0.0], [3.0, 3.0]]), atol=0.0
     )
 
 

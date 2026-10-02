@@ -8,13 +8,21 @@ version = "0.1.0"
 [tasks]
 build = "bash build/build.sh"
 test = "python -m pytest tests -q"
-bench = "flock /tmp/mojo-bench.lock python bench/bench.py"
+bench = "flock -w 3600 /tmp/mojo-bench.lock python bench/bench.py"
+# upstream `stellargraph` 1.2.1 needs Python < 3.9, so its parity environment
+# cannot be this pixi env; see tools/setup_upstream_env.sh.
+setup-upstream = "bash tools/setup_upstream_env.sh"
+dump-upstream = "bash -c '\"$PWD/.upstream/.venv/bin/python\" tools/dump_upstream.py'"
 
 [activation.env]
 PYTHONPATH = "python"
 
 [dependencies]
-mojo = "==1.2.0.dev2026092605"
+mojo = "==1.2.0.dev2026092905"
+# `parallelize` and the GPU host API moved from `std` to `max` in 1.2.0, and the
+# `max` package version is released in lockstep with the compiler: a mismatched
+# pair fails to solve, so both are pinned to the same date.
+max = "==26.7.0.dev2026092905"
 python = "3.13.*"
 pytest = "*"
 numpy = "*"

@@ -88,8 +88,8 @@ def MeanHinAggregator_call(
                     j += 1
             dot(
                 work,
-                w_neigh + r * d * half_output_dim,
-                scratch + r * b * h * half_output_dim,
+                w_neigh.unsafe_offset(r * d * half_output_dim),
+                scratch.unsafe_offset(r * b * h * half_output_dim),
                 b * h,
                 d,
                 half_output_dim,

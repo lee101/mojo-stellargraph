@@ -57,7 +57,7 @@ def _head_dense(
     # attn_for_self  = K.dot(features, attention_kernel[0])   (n x 1)
     # attn_for_neighs = K.dot(features, attention_kernel[1])  (n x 1)
     dot_vec(features, attn_kernel, attn_self, n, units)
-    dot_vec(features, attn_kernel + units, attn_neighs, n, units)
+    dot_vec(features, attn_kernel.unsafe_offset(units), attn_neighs, n, units)
 
     # dense = attn_for_self + K.transpose(attn_for_neighs)    (n x n)
     # dense = LeakyReLU(alpha=0.2)(dense)
@@ -165,10 +165,8 @@ def GraphAttention_call(
     Upstream's `Dropout` layers are identities at inference, which is the only
     mode this port implements.
     """
-    var out_dim = 0
-    if attn_heads_reduction == HEADS_REDUCTION_CONCAT:
-        out_dim = units * attn_heads
-    else:
+    var out_dim = units * attn_heads
+    if attn_heads_reduction != HEADS_REDUCTION_CONCAT:
         out_dim = units
 
     # Scratch: work is [n*units features | n*n dense | n attn_self |
@@ -177,14 +175,14 @@ def GraphAttention_call(
         _head_dense(
             x,
             a,
-            kernel + head * f * units,
-            attn_kernel + head * 2 * units,
-            bias + head * units,
-            work2 + head * n * units,
+            kernel.unsafe_offset(head * f * units),
+            attn_kernel.unsafe_offset(head * 2 * units),
+            bias.unsafe_offset(head * units),
+            work2.unsafe_offset(head * n * units),
             work,
-            work + n * units,
-            work + n * units + n * n,
-            work + n * units + n * n + n,
+            work.unsafe_offset(n * units),
+            work.unsafe_offset(n * units + n * n),
+            work.unsafe_offset(n * units + n * n + n),
             n,
             f,
             units,
@@ -291,7 +289,7 @@ def _head_sparse(
 
     # attn_for_self / attn_for_neighs = K.dot(features, attention_kernel[k])
     dot_vec(features, attn_kernel, attn_self, n, units)
-    dot_vec(features, attn_kernel + units, attn_neighs, n, units)
+    dot_vec(features, attn_kernel.unsafe_offset(units), attn_neighs, n, units)
 
     # sparse_attn_self  = tf.gather(reshape(attn_for_self, [-1]), A_indices[:, 0])
     # sparse_attn_neighs = tf.gather(reshape(attn_for_neighs, [-1]), A_indices[:, 1])
@@ -311,7 +309,9 @@ def _head_sparse(
     sparse_softmax(a_indptr, attn_values, attn_norm, n)
 
     # node_features = tf.sparse.matmul(sparse_attn, dropout_feat)
-    sparse_dense_matmul(a_indptr, a_cols, attn_norm, features, result, n, units)
+    _ = sparse_dense_matmul(
+        a_indptr, a_cols, attn_norm, features, result, n, units, n
+    )
 
     # if self.use_bias: node_features = K.bias_add(node_features, self.biases[head])
     if use_bias:
@@ -364,15 +364,15 @@ def GraphAttentionSparse_call(
             a_rows,
             a_cols,
             a_indptr,
-            kernel + head * f * units,
-            attn_kernel + head * 2 * units,
-            bias + head * units,
-            work2 + head * n * units,
+            kernel.unsafe_offset(head * f * units),
+            attn_kernel.unsafe_offset(head * 2 * units),
+            bias.unsafe_offset(head * units),
+            work2.unsafe_offset(head * n * units),
             work,
-            work + n * units,
-            work + n * units + n,
-            work + n * units + 2 * n,
-            work + n * units + 2 * n + e,
+            work.unsafe_offset(n * units),
+            work.unsafe_offset(n * units + n),
+            work.unsafe_offset(n * units + 2 * n),
+            work.unsafe_offset(n * units + 2 * n + e),
             n,
             e,
             f,

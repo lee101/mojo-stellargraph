@@ -45,6 +45,15 @@ def _normalized_laplacian(adj: np.ndarray, symmetric: bool = True) -> np.ndarray
     return np.eye(adj.shape[0]) - _normalize_adj(adj, symmetric)
 
 
+def _calculate_laplacian(adj: np.ndarray) -> np.ndarray:
+    """`D = diag(ravel(adj.sum(axis=0)) ** -0.5); return D.dot(adj).dot(D)`.
+
+    The degree is the COLUMN sum here, where `_normalize_adj` uses the row sum.
+    """
+    d = np.diag(np.ravel(adj.sum(axis=0)) ** (-0.5))
+    return d.dot(adj).dot(d)
+
+
 def _rescale_laplacian(laplacian: np.ndarray, largest_eigval: float) -> np.ndarray:
     return (2.0 / largest_eigval) * laplacian - np.eye(laplacian.shape[0])
 

@@ -5,7 +5,8 @@ built on the same SIMD path.
 the primitive every layer kernel multiplies through -- so these tests reach
 it through the two exported entry points that call it with a shape the caller
 chooses: `GraphConvolution` (`A @ features` then `h_graph @ kernel`) and
-`chebyshev_polynomial` (an `[n, n]` square product, once per degree).
+`GCN_Aadj_feats_op(method='sgc')` (an `[n, n]` square product, once per
+power).
 
 `dot` has two kernels and picks between them on the size of the right-hand
 operand, so the point of these tests is the shape sweep: `n` odd and even, `m`
@@ -78,17 +79,23 @@ def test_dot_matches_numpy_on_the_streaming_kernel(n, units):
 
 
 @pytest.mark.parametrize("n, k", [(9, 2), (10, 2), (9, 3), (61, 2), (62, 2)])
-def test_chebyshev_square_product_matches_numpy(n, k):
-    """`chebyshev_polynomial` multiplies an `[n, n]` square once per degree.
-    The two sizes straddle the 1 MiB dispatch, so both kernels are in play."""
+def test_sgc_square_product_matches_numpy(n, k):
+    """`method="sgc"` multiplies an `[n, n]` normalized adjacency once per
+    power. The two sizes straddle the 1 MiB dispatch, so both `dot` kernels
+    are in play."""
     rng = np.random.default_rng(11)
-    x = np.ascontiguousarray(rng.normal(size=(n, n)))
-    got = sg.chebyshev_polynomial(x, k)
-    t_prev = np.eye(n)
-    t_curr = x
-    for step in range(2, k + 1):
-        t_prev, t_curr = t_curr, 2.0 * x @ t_curr - t_prev
-    np.testing.assert_allclose(got[-1], t_curr, rtol=0.0, atol=ATOL * 1e3)
+    adj = np.ascontiguousarray(
+        np.maximum(rng.random((n, n)) < 0.2, 0).astype(np.float64)
+    )
+    adj = np.maximum(adj, adj.T)
+    np.fill_diagonal(adj, 0.0)
+    if not adj.any():
+        adj[0, 1] = adj[1, 0] = 1.0
+    _, got = sg.GCN_Aadj_feats_op(None, adj, k=k, method="sgc")
+    _, base = sg.GCN_Aadj_feats_op(None, adj, k=1, method="gcn")
+    np.testing.assert_allclose(
+        got, np.linalg.matrix_power(base, k), rtol=0.0, atol=ATOL * 1e3
+    )
 
 
 @pytest.mark.parametrize("act", ["relu", "elu", "sigmoid", "tanh", "softmax", "softplus"])

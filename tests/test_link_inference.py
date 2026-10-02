@@ -464,3 +464,90 @@ def test_softmax_output_on_a_wide_arm_is_a_normalized_distribution():
         edge_embedding_method="hadamard",
     )
     np.testing.assert_allclose(got, exp, atol=1e-9, rtol=0.0)
+
+
+@pytest.mark.parametrize("size", [1, 3, 9])
+def test_a_bias_of_the_wrong_length_is_rejected(size):
+    """The kernel adds `bias[j]` for every output column, so a short bias is an
+    out-of-bounds read of the caller's buffer rather than a wrong number."""
+    d, output_dim, n = 4, 8, 5
+    with pytest.raises(ValueError):
+        sg.link_inference(
+            output_dim=output_dim,
+            output_act="linear",
+            edge_embedding_method="hadamard",
+            kernel=np.zeros((d, output_dim)),
+            bias=np.zeros(size),
+        )
+
+
+def test_a_bias_of_the_output_width_is_accepted():
+    d, output_dim, n = 4, 8, 5
+    fn = sg.link_inference(
+        output_dim=output_dim,
+        output_act="linear",
+        edge_embedding_method="hadamard",
+        kernel=np.zeros((d, output_dim)),
+        bias=np.arange(output_dim, dtype=np.float64),
+    )
+    np.testing.assert_allclose(
+        fn(np.zeros((n, d)), np.zeros((n, d))),
+        np.tile(np.arange(output_dim, dtype=np.float64), (n, 1)),
+        rtol=0,
+        atol=0,
+    )
+
+
+# ------------------------------------------------- the `concat` contraction
+#
+# `concat` is the one arm whose `Dense` input is never materialised: the kernel
+# contracts `x0 @ kernel[:d] + x1 @ kernel[d:]` directly, two rows and two
+# column blocks at a time. Every other arm goes through the shared `dot`, so a
+# regression in `_dot_concat` shows up here alone.
+@pytest.mark.parametrize("n", [1, 2, 3, 5, 8, 17])
+@pytest.mark.parametrize("d", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("output_dim", [1, 2, 3, 5, 8, 9, 16, 17])
+def test_concat_is_the_dense_contraction(n, d, output_dim):
+    """`concat([x0, x1]) @ kernel + bias`, for every row-blocking and
+    column-blocking shape the kernel can land in."""
+    x0, x1 = _embeddings(n, d, seed=n * 31 + d)
+    kernel = _kernel(2 * d, output_dim, seed=output_dim)
+    bias = np.ascontiguousarray(np.arange(output_dim, dtype=np.float64))
+    fn = sg.link_inference(
+        output_dim=output_dim,
+        output_act="linear",
+        edge_embedding_method="concat",
+        kernel=kernel,
+        bias=bias,
+    )
+    got = fn(x0, x1)
+    assert got.shape == (n, output_dim)
+    np.testing.assert_allclose(
+        got, np.concatenate([x0, x1], axis=-1) @ kernel + bias, rtol=1e-12, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        got, ref.link_inference(x0, x1, kernel, bias, output_dim, "linear", "concat"),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_concat_wide_output_matches_an_identity_kernel():
+    """With `kernel` the identity on the first `d` columns, `concat` has to
+    return `x0`; a second row must come back as that row's own `x0`, not a copy
+    of the first."""
+    n, d, output_dim = 3, 4, 10
+    x0, x1 = _embeddings(n, d, seed=17)
+    kernel = np.zeros((2 * d, output_dim))
+    kernel[np.arange(d), np.arange(d)] = 1.0
+    fn = sg.link_inference(
+        output_dim=output_dim,
+        output_act="linear",
+        edge_embedding_method="concat",
+        kernel=kernel,
+    )
+    got = fn(x0, x1)
+    np.testing.assert_allclose(got[:, :d], x0, rtol=0, atol=0)
+    np.testing.assert_allclose(got[:, d:], np.zeros((n, output_dim - d)), atol=0)
+    # row 1 must not be a copy of row 0
+    assert not np.allclose(got[0], got[1])

@@ -168,10 +168,7 @@ def test_a_non_monotonic_indptr_is_a_dead_end_not_an_out_of_bounds_read():
     assert walks == [[1]]
 
 
-def test_naive_weighted_choices_reports_a_non_positive_degree():
-    indptr = np.array([0, 1, 0, 1], dtype=np.int32)
-    colind = np.array([1, 0], dtype=np.int32)
-    with pytest.raises(ValueError):
-        sg.explorer.naive_weighted_choices(
-            (indptr, colind), np.array([1.0]), 1, seed=0
-        )
+def test_naive_weighted_choices_of_an_empty_weight_vector_is_none():
+    """Upstream's `probs[-1]` on an empty iterator would raise, so there is
+    nothing to choose; the kernel returns `None` before touching `colind`."""
+    assert sg.naive_weighted_choices(np.zeros(0), seed=0) is None

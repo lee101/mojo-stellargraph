@@ -16,12 +16,11 @@ from mojostellargraph.appnp import (
 )
 from mojostellargraph.core_utils import (
     GCN_Aadj_feats_op,
-    METHOD_CHEBYSHEV,
     METHOD_GCN,
     METHOD_NONE,
     METHOD_SGC,
     PPNP_Aadj_feats_op,
-    chebyshev_polynomial,
+    calculate_laplacian,
     invert,
     normalized_laplacian,
     normalize_adj,
@@ -78,6 +77,11 @@ def msg_normalized_laplacian(adj: Int, lap: Int, d: Int, n: Int, symmetric: Int)
     normalized_laplacian(f(adj), f(lap), f(d), n, symmetric)
 
 
+@export("msg_calculate_laplacian")
+def msg_calculate_laplacian(adj: Int, dst: Int, d: Int, n: Int) abi("C"):
+    calculate_laplacian(f(adj), f(dst), f(d), n)
+
+
 @export("msg_rescale_laplacian")
 def msg_rescale_laplacian(lap: Int, dst: Int, n: Int, eigval: Float64) abi("C"):
     rescale_laplacian(f(lap), f(dst), n, eigval)
@@ -88,11 +92,6 @@ def msg_power_iteration(
     a: Int, work: Int, vec: Int, n: Int, max_iter: Int, tol: Float64
 ) abi("C") -> Float64:
     return power_iteration(f(a), f(work), f(vec), n, max_iter, tol)
-
-
-@export("msg_chebyshev_polynomial")
-def msg_chebyshev_polynomial(x: Int, result: Int, work: Int, n: Int, k: Int) abi("C"):
-    chebyshev_polynomial(f(x), f(result), f(work), n, k)
 
 
 @export("msg_PPNP_Aadj_feats_op")
@@ -109,13 +108,12 @@ def msg_GCN_Aadj_feats_op(
     work: Int,
     work2: Int,
     scratch: Int,
-    cheb: Int,
     n: Int,
     k: Int,
     method: Int,
 ) abi("C") -> Int:
     return GCN_Aadj_feats_op(
-        f(adj), f(result), f(work), f(work2), f(scratch), f(cheb), n, k, method
+        f(adj), f(result), f(work), f(work2), f(scratch), n, k, method
     )
 
 
@@ -622,6 +620,7 @@ def msg_uniform_random_walk(
 def msg_biased_random_walk(
     indptr: Int,
     colind: Int,
+    edge_weights: Int,
     roots: Int,
     walks_out: Int,
     lens_out: Int,
@@ -634,10 +633,12 @@ def msg_biased_random_walk(
     p: Float64,
     q: Float64,
     seed: Int,
+    weighted: Int,
 ) abi("C"):
     biased_random_walk(
         i(indptr),
         i(colind),
+        edge_weights,
         i(roots),
         i(walks_out),
         i(lens_out),
@@ -650,6 +651,7 @@ def msg_biased_random_walk(
         p,
         q,
         seed,
+        weighted,
     )
 
 
@@ -684,7 +686,7 @@ def msg_sparse_dense_matmul(
     n: Int,
     d: Int,
     dense_rows: Int,
-) abi("C"):
-    sparse_dense_matmul(
+) abi("C") -> Int:
+    return sparse_dense_matmul(
         i(indptr), i(colind), f(values), f(dense), f(dst), n, d, dense_rows
     )

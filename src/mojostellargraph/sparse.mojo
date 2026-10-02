@@ -41,22 +41,26 @@ def sparse_dense_matmul(
     n: Int,
     d: Int,
     dense_rows: Int,
-):
+) -> Int:
     """`tf.sparse.matmul(a, b)` with `a` in row-major `SparseTensor` form,
     `b` dense `[dense_rows, d]` and a result dense `[n, d]`.
 
-    `dense_rows` is `a`'s column count, which is the row stride of `b` and is
-    not `d` unless the product happens to be square."""
+    `dense_rows` is `a`'s column count, which is the row count `b` must have;
+    `b`'s own row stride is `d`. Returns 0 if a stored column index falls
+    outside `dense_rows`, which is an out-of-bounds gather, and 1 otherwise.
+    """
     for r in range(n):
         for c in range(d):
             var acc = 0.0
             for k in range(
                 Int(iget(indptr, r)), Int(iget(indptr, r + 1))
             ):
-                acc += values.unsafe_load(k) * dense.unsafe_load(
-                    Int(iget(colind, k)) * dense_rows + c
-                )
+                var col = Int(iget(colind, k))
+                if col < 0 or col >= dense_rows:
+                    return 0
+                acc += values.unsafe_load(k) * dense.unsafe_load(col * d + c)
             dst.unsafe_store(r * d + c, acc)
+    return 1
 
 
 def sparse_dense_matvec(

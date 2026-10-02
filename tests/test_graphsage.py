@@ -405,8 +405,10 @@ def test_attentional_aggregator_accepts_more_neighbours_than_output_width(r):
     assert got.shape == (B, H, units)
     assert np.isfinite(got).all()
     # a single group, so the whole `output_dim` is that group's, and the
-    # numbers are the oracle's rather than merely finite
-    w, w_attn_s, w_attn_g = agg.w_group[0], agg.w_attn_s, agg.w_attn_g
+    # numbers are the oracle's rather than merely finite. Upstream's loop is
+    # `for ii, x_g in enumerate(inputs[1:]): group_idx = ii + 1`, so the one
+    # neighbour group uses `w_group[1]`; `w_group[0]` is the head weight.
+    w, w_attn_s, w_attn_g = agg.w_group[1], agg.w_attn_s, agg.w_attn_g
     want = ref.graphsage_aggregator_call(
         ref.attentional_aggregator_group_aggregate(
             x_self[:, :, 0, :], x_neigh, w, w_attn_s, w_attn_g

@@ -210,76 +210,21 @@ def test_rescale_laplacian_default_eigenvalue_tracks_the_reference(adj_with_loop
     )
 
 
-# ------------------------------------------------------------ chebyshev_polynomial
-@pytest.mark.parametrize("k", [1, 2, 3, 4, 6])
-def test_chebyshev_polynomial_matches_reference(adj_with_loops, k):
-    lap = sg.normalized_laplacian(adj_with_loops)
-    scaled = sg.rescale_laplacian(lap, float(np.linalg.eigvalsh(lap)[-1]))
-    got = sg.chebyshev_polynomial(scaled, k)
-    want = ref._chebyshev_polynomial(scaled, k)
-    assert len(got) == k + 1
-    for i, (a, b) in enumerate(zip(got, want)):
-        np.testing.assert_allclose(a, b, atol=ATOL, rtol=0.0, err_msg="T_{}".format(i))
+# ------------------------------------------------------- chebyshev (removed)
+def test_chebyshev_polynomial_is_not_part_of_the_api():
+    """Upstream 1.2.1 removed `chebyshev_polynomial` from
+    `stellargraph/core/utils.py`; the port must not re-expose it."""
+    assert not hasattr(sg, "chebyshev_polynomial")
 
 
-@pytest.mark.parametrize("k", [1, 2, 3, 4, 6])
-def test_chebyshev_polynomial_leading_terms(adj_with_loops, k):
-    lap = sg.normalized_laplacian(adj_with_loops)
-    scaled = sg.rescale_laplacian(lap, float(np.linalg.eigvalsh(lap)[-1]))
-    got = sg.chebyshev_polynomial(scaled, k)
-    np.testing.assert_array_equal(got[0], np.eye(scaled.shape[0]))
-    np.testing.assert_array_equal(got[1], scaled)
-
-
-@pytest.mark.parametrize("k", [0, 1])
-def test_chebyshev_polynomial_of_degree_zero_is_the_identity(adj_with_loops, k):
-    # upstream seeds the list as [I, X] and loops from 2, so it hands back at
-    # least two matrices whatever k is
-    lap = sg.normalized_laplacian(adj_with_loops)
-    got = sg.chebyshev_polynomial(lap, k)
-    assert len(got) == 2
-    np.testing.assert_array_equal(got[0], np.eye(lap.shape[0]))
-    np.testing.assert_array_equal(got[1], lap)
-
-
-@pytest.mark.parametrize("k", [2, 3, 4, 5])
-def test_chebyshev_recurrence(adj_with_loops, k):
-    # T_k = 2 X T_{k-1} - T_{k-2}, the recurrence upstream loops on.
-    lap = sg.normalized_laplacian(adj_with_loops)
-    x = sg.rescale_laplacian(lap, float(np.linalg.eigvalsh(lap)[-1]))
-    got = sg.chebyshev_polynomial(x, k)
-    for i in range(2, k + 1):
-        np.testing.assert_allclose(
-            got[i], 2.0 * x @ got[i - 1] - got[i - 2], atol=ATOL, rtol=0.0
-        )
-
-
-@pytest.mark.parametrize("k", [0, 1, 2, 3, 4, 5, 6])
-def test_chebyshev_polynomials_reproduce_cosine_on_a_diagonal(k):
-    # Published identity: T_k(cos t) = cos(k t), and cos(k * arccos(x)) is
-    # therefore T_k applied to a matrix whose diagonal holds x.
-    x = np.array([0.3, -0.7, 1.0, 0.0, -1.0, 0.5])
-    got = sg.chebyshev_polynomial(np.diag(x), k)
-    np.testing.assert_allclose(
-        np.diag(got[k]), np.cos(k * np.arccos(x)), atol=ATOL, rtol=0.0
-    )
-
-
-def test_chebyshev_polynomials_commute(rng):
-    # Every T_k is a polynomial in X, so any two of them commute.
-    x = rng.normal(size=(7, 7))
-    x = (x + x.T) / 2.0
-    ts = sg.chebyshev_polynomial(x, 4)
-    np.testing.assert_allclose(ts[3] @ ts[1], ts[1] @ ts[3], atol=1e-11, rtol=0.0)
-
-
-def test_chebyshev_polynomial_parity(rng):
-    # T_k(-X) = (-1)^k T_k(X).
-    x = rng.normal(size=(6, 6))
-    plus = sg.chebyshev_polynomial(x, 5)
-    minus = sg.chebyshev_polynomial(-x, 5)
-    for k in range(6):
-        np.testing.assert_allclose(minus[k], ((-1) ** k) * plus[k], atol=ATOL, rtol=0.0)
+@pytest.mark.parametrize("k", [1, 2, 3, 5])
+def test_gcn_aadj_feats_op_rejects_the_removed_chebyshev_method(adj_with_loops, k):
+    """Upstream 1.2.1 raises this exact ValueError for `method="chebyshev"`,
+    whatever `k` is; the port raises the same message."""
+    with pytest.raises(
+        ValueError, match="did not behave correctly and has been removed"
+    ):
+        sg.GCN_Aadj_feats_op(None, adj_with_loops, k=k, method="chebyshev")
 
 
 # ---------------------------------------------------------------------- invert
@@ -438,34 +383,6 @@ def test_gcn_sgc_kth_power(adj_with_loops, k):
     np.testing.assert_allclose(got, np.linalg.matrix_power(a_norm, k), atol=ATOL, rtol=0.0)
 
 
-@pytest.mark.parametrize("k", [2, 3, 4])
-def test_gcn_chebyshev_stack_matches_reference(adj_with_loops, k):
-    stack, out = sg.GCN_Aadj_feats_op(
-        np.zeros((1, 1)), adj_with_loops, k=k, method="chebyshev"
-    )
-    # upstream returns `[features] + T_k` and leaves the adjacency alone.
-    assert len(stack) == k + 2
-    np.testing.assert_array_equal(out, np.maximum(adj_with_loops, adj_with_loops.T))
-    for i, want in enumerate(ref.gcn_aadj_feats_op(adj_with_loops, k, "chebyshev")):
-        np.testing.assert_allclose(stack[i + 1], want, atol=EIG_ATOL, rtol=0.0)
-
-
-def test_gcn_chebyshev_leading_entries(adj_with_loops, features):
-    stack, out = sg.GCN_Aadj_feats_op(features, adj_with_loops, k=2, method="chebyshev")
-    # upstream returns `[features] + T_k`; the adjacency stays the symmetrized A.
-    np.testing.assert_array_equal(stack[0], features)
-    np.testing.assert_array_equal(stack[1], np.eye(adj_with_loops.shape[0]))
-    np.testing.assert_array_equal(out, np.maximum(adj_with_loops, adj_with_loops.T))
-
-
-def test_gcn_chebyshev_first_block_is_the_rescaled_laplacian(adj_with_loops):
-    stack, _ = sg.GCN_Aadj_feats_op(np.zeros((1, 1)), adj_with_loops, k=2, method="chebyshev")
-    lap = sg.normalized_laplacian(adj_with_loops)
-    np.testing.assert_allclose(
-        stack[2], sg.rescale_laplacian(lap, sg.power_iteration(lap)), atol=EIG_ATOL, rtol=0.0
-    )
-
-
 @pytest.mark.parametrize("method", ["gcn", "sgc", "none", None])
 def test_gcn_returns_features_unchanged(adj_with_loops, features, method):
     got, _ = sg.GCN_Aadj_feats_op(features, adj_with_loops, k=2, method=method)
@@ -498,7 +415,7 @@ def test_gcn_default_method_is_gcn(adj_with_loops):
     [
         ("chebyshev", 1),
         ("chebyshev", 0),
-        ("chebyshev", -2),
+        ("chebyshev", -2),  # upstream 1.2.1 removed this method outright
         ("sgc", 0),
         ("sgc", -1),
         ("bogus", 1),
@@ -604,23 +521,6 @@ def test_normalize_adj_left_only_leaves_an_isolated_node_at_zero():
     assert np.isfinite(got).all()
 
 
-def test_chebyshev_T0_is_the_identity_whatever_the_buffer_held():
-    """`T_0` is `sp.eye(n)`, so every off-diagonal entry is written, not just
-    the diagonal: `result` belongs to the caller."""
-    from mojostellargraph._lib import addr, f64, lib
-
-    n, k = 4, 3
-    x = np.random.default_rng(1).normal(size=(n, n))
-    x = np.ascontiguousarray((x + x.T) / 2.0)
-    # the polynomials land consecutively: `k + 1` blocks of `n * n`
-    xf = f64(x)
-    rf = np.full((k + 1) * n * n, -7.0)
-    wf = np.zeros(n * n)
-    lib().msg_chebyshev_polynomial(addr(xf), addr(rf), addr(wf), n, k)
-    t0 = rf[: n * n].reshape(n, n)
-    np.testing.assert_array_equal(t0, np.eye(n))
-
-
 def test_rescale_laplacian_survives_a_failed_eigensolve():
     """Upstream substitutes `largest_eigval = 2` when ARPACK does not
     converge, which is a scale of 1.0. `power_iteration` reports failure as
@@ -631,10 +531,10 @@ def test_rescale_laplacian_survives_a_failed_eigensolve():
     np.testing.assert_allclose(got, sg.rescale_laplacian(lap, largest_eigval=2.0))
 
 
-def test_gcn_aadj_feats_op_chebyshev_is_finite_on_a_two_node_graph():
-    """A two-node graph's normalized Laplacian is regular, which is the case
-    a constant power-iteration start vector stalls on."""
+def test_gcn_aadj_feats_op_sgc_is_finite_on_a_two_node_graph():
+    """A two-node graph's normalized adjacency is regular, which is the case a
+    constant power-iteration start vector would stall on."""
     adj = np.array([[0.0, 1.0], [1.0, 0.0]])
     feats = np.arange(4.0).reshape(2, 2)
-    out, _ = sg.GCN_Aadj_feats_op(feats, adj, method="chebyshev", k=2)
-    assert all(np.isfinite(t).all() for t in out)
+    _, out = sg.GCN_Aadj_feats_op(feats, adj, method="sgc", k=2)
+    assert np.isfinite(out).all()

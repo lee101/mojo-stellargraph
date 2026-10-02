@@ -300,9 +300,9 @@ def AttentionalAggregator_group_aggregate(
     var all_at = neigh_at + bh * s * out_dim
 
     # xw_neigh = K.dot(x_g, w_g)
-    dot(x_g, w_g, work2 + neigh_at, bh * s, d, out_dim)
+    dot(x_g, w_g, work2.unsafe_offset(neigh_at), bh * s, d, out_dim)
     # xw_self = K.dot(x_self, w_g)
-    dot(x_self, w_g, work2 + self_at, bh, d_self, out_dim)
+    dot(x_self, w_g, work2.unsafe_offset(self_at), bh, d_self, out_dim)
 
     # xw_all = K.concatenate([xw_self, xw_neigh], axis=2)
     for i in range(bh):

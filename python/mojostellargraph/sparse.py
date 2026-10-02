@@ -107,8 +107,14 @@ def sparse_matmul_dense(a: SparseTensor, dense: np.ndarray) -> np.ndarray:
         )
     d = dense.shape[1]
     dst = np.zeros((rows, d), dtype=np.float64)
-    lib().msg_sparse_dense_matmul(
+    rc = lib().msg_sparse_dense_matmul(
         addr(a.indptr), addr(a.colind), addr(a.canonical_values),
         addr(dense), addr(dst), rows, d, dense.shape[0],
     )
+    if rc == 0:
+        raise IndexError(
+            "sparse column index outside the {} rows of the right-hand side".format(
+                dense.shape[0]
+            )
+        )
     return dst
